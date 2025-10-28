@@ -736,39 +736,35 @@ bool Detect_PinBar(int shift, bool &isBuy){
 // -------------------------------------------------------------------
 // Построение сигнала Pin Bar с проверкой дневного экстремума + окна
 // -------------------------------------------------------------------
-// ================================================================
-// Helpers for Pin Bar gate: trade window + full-day extremes
-// ================================================================
-bool IsWithinTradeWindow(datetime t, int startHour, int endHour)
+// ===== Helpers: окно + экстремумы дня (00:00..23:59 брокера) =====
+bool IsWithinTradeWindow(datetime t, int startHour, int startMin, int endHour, int endMin)
 {
    MqlDateTime md; TimeToStruct(t, md);
-   int h = md.hour;
+   int cur = md.hour*60 + md.min;
+   int beg = startHour*60 + startMin;
+   int end = endHour*60 + endMin;
 
-   if(startHour == endHour) return true; // 24/7
+   if(beg==end) return true; // 24/7
 
-   if(startHour < endHour)
-      return (h >= startHour && h < endHour);
-
-   // Ночное окно, например 22..02
-   return (h >= startHour || h < endHour);
+   if(beg < end) return (cur >= beg && cur < end);      // дневное окно
+   return (cur >= beg || cur < end);                    // ночное окно (наперекат)
 }
 
 void GetDayHighLow(datetime bar_time, double &dayHigh, double &dayLow)
 {
    MqlDateTime md; TimeToStruct(bar_time, md);
-   md.hour = 0; md.min = 0; md.sec = 0;
+   md.hour=0; md.min=0; md.sec=0;
    datetime dayStart = StructToTime(md);
    datetime dayEnd   = dayStart + 24*60*60;
 
-   dayHigh = -DBL_MAX;
-   dayLow  =  DBL_MAX;
+   dayHigh = -DBL_MAX; dayLow = DBL_MAX;
 
    for(int s=0;; s++)
    {
       datetime t = iTime(NULL, PERIOD_H1, s);
-      if(t == 0)         break;        // нет баров
-      if(t < dayStart)   break;        // ушли в прошлый день
-      if(t >= dayEnd)    continue;     // следующий день — пропустить
+      if(t==0) break;
+      if(t < dayStart) break;
+      if(t >= dayEnd) continue;
 
       double h = iHigh(NULL, PERIOD_H1, s);
       double l = iLow (NULL, PERIOD_H1, s);
@@ -777,27 +773,23 @@ void GetDayHighLow(datetime bar_time, double &dayHigh, double &dayLow)
    }
 }
 
-// Гейт для Pin Bar: внутри окна + бар = экстремум всего дня
+// ===== Гейт: окно + верный экстремум (BUY=Low дня, SELL=High дня) =====
 bool PinBar_DailyExtremeAndWindowGate(int shift, bool isBuy)
 {
    datetime bar_time = iTime(NULL, PERIOD_H1, shift);
-   if(bar_time == 0) return false;
+   if(bar_time==0) return false;
 
-   if(!IsWithinTradeWindow(bar_time, StartHour, EndHour))
+   if(!IsWithinTradeWindow(bar_time, StartHour, StartMinute, EndHour, EndMinute))
       return false;
 
-   double dayHigh, dayLow;
-   GetDayHighLow(bar_time, dayHigh, dayLow);
-
+   double dayHigh, dayLow; GetDayHighLow(bar_time, dayHigh, dayLow);
    double thisHigh = iHigh(NULL, PERIOD_H1, shift);
    double thisLow  = iLow (NULL, PERIOD_H1, shift);
 
-   double eps = (Point > 0 ? Point*0.5 : 1e-10);
+   double eps = (Point>0 ? Point*0.5 : 1e-10);
 
-   if(isBuy)
-      return (MathAbs(thisHigh - dayHigh) <= eps); // бычий PB = HIGH дня
-   else
-      return (MathAbs(thisLow  - dayLow ) <= eps); // медвежий PB = LOW дня
+   if(isBuy)  return (MathAbs(thisLow  - dayLow ) <= eps); // BUY: Low дня
+   else       return (MathAbs(thisHigh - dayHigh) <= eps); // SELL: High дня
 }
 bool BuildSignal_PinBar(SignalInfo &sig){
    if(!UsePinBar) return false;
