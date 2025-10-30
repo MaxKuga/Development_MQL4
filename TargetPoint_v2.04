@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Built by MaximK"
 #property link      ""
-#property version   "2.02"
+#property version   "2.04"
 #property strict
 #property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
 
@@ -429,8 +429,9 @@ void ManageBreakevenByLine(){
       }
    }
 }
-
-// === Фильтр геометрии относительно SOLID-линии ===
+//-------------------------------------------------------------------
+//    Фильтр геометрии относительно SOLID-линии                   |
+//-------------------------------------------------------------------
 bool IsValidByLineGeometry(bool isBuy, double refPrice)
 {
    if (!HasAnyValidSolidHLine()) return true; // в NoLine режим-фильтр не применяется
@@ -452,8 +453,9 @@ double MaxEntryDistanceATR(){
    // Совместимость со старой логикой: допускаем половину дневного ATR как максимум,
    return 0.5; // 0.5 * ATR(D1)
 }
-
-// === Управление Limit Line ===
+//----------------------------------------------------------------------
+//           Управление Limit Line                                   |
+//----------------------------------------------------------------------
 void UpdateLimitLine(){
    if(ObjectFind(0,LimitLineName) < 0){
       LimitActive = false;
@@ -533,9 +535,9 @@ if(lot > 0)
 
          }
       }
-
-
-// === Кнопки направления ===
+//---------------------------------------------------
+// Кнопки направления                               |
+//---------------------------------------------------
 void CreateDirectionButtons(){
    int btn_width=60, btn_height=25, y_pos=30, x_start=10;
 
@@ -658,8 +660,9 @@ void CheckButtonStates(){
       CloseAll();
    }
 }
-
-// ===================== АНТИ-ПОВТОР ПАТТЕРНА ======================
+//---------------------------------------------------------
+// АНТИ-ПОВТОР ПАТТЕРНА                                 |
+//---------------------------------------------------------
 string ComposePatternKey(bool lineMode,bool isBuy,datetime a_time,datetime b_time){
    string mode=lineMode?"LINE":"NL";
    string dir =isBuy?"BUY":"SELL";
@@ -708,8 +711,9 @@ bool PassDayExtremeFilter(bool isBuy){
    if(isBuy) return AlmostEqual(CandleLow(1), dayLow);
    else      return AlmostEqual(CandleHigh(1), dayHigh);
 }
-
-// Детекция Pin Bar на закрытой свече (shift=1)
+//-----------------------------------------------------
+// Определение Pin Bar на закрытой свече            |
+//-----------------------------------------------------
 bool Detect_PinBar(int shift, bool &isBuy){
    double O = CandleOpen(shift);
    double C = CandleClose(shift);
@@ -870,8 +874,9 @@ void FillSL_TP_PinBar(SignalInfo &sig){
       sig.tpPrice = 0.0;
    }
 }
-
-// Исполнение рыночного ордера для Pin Bar
+//-----------------------------------------------------
+// Pin Bar market execute                             |
+//-----------------------------------------------------
 bool ExecuteSignal_PinBar(const SignalInfo &sig){
    if(!sig.valid) return false;
 
@@ -912,7 +917,7 @@ bool ExecuteSignal_PinBar(const SignalInfo &sig){
 
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                            |
+//| Expert initialization      OnInit                                |
 //+------------------------------------------------------------------+
 int OnInit(){
    CurrentTradeDir = InputTradeDir;
@@ -1096,8 +1101,9 @@ if(!CanTradeToday())
       g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
       return;
    }
-
-   // ======= LINE MODE =======
+   // ----------------------------------------------------------- 
+   //                      LINE MODE                           //                 
+   // -----------------------------------------------------------
    UpdateLineLevel();
    if (Level==0.0){ if (Debug) Print("Error: Invalid line level (no SOLID HLine)."); return; }
 
@@ -1197,7 +1203,6 @@ if(!CanTradeToday())
 
    g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
 }
-
 //+------------------------------------------------------------------+
 //| Pattern check (NoLine market-pattern)                            |
 //+------------------------------------------------------------------+
@@ -1914,7 +1919,7 @@ void DrawNewImpulseDot(int shift){
 }
 
 //+------------------------------------------------------------------+
-//| Viz                                                              |
+//| Vizualization                                                    |
 //+------------------------------------------------------------------+
 void DrawVLine(string name,datetime t,color c){ if(ObjectFind(name)>=0) ObjectDelete(name); ObjectCreate(name,OBJ_VLINE,0,t,0); ObjectSet(name,OBJPROP_COLOR,c); ObjectSet(name,OBJPROP_STYLE,STYLE_DOT); }
 void DrawArrow(string name,datetime t,double price,color c,int code){ if(ObjectFind(name)>=0) ObjectDelete(name); ObjectCreate(name,OBJ_ARROW,0,t,price); ObjectSet(name,OBJPROP_COLOR,c); ObjectSet(name,OBJPROP_ARROWCODE,code); }
