@@ -9,6 +9,7 @@
 #property strict
 #property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
 
+int LastLoggedDirection = 0; // Последнее залогированное направление (1=OnlyBuy, -1=OnlySell)
 // Переменные для логики без убытка (из v2.01)
 int LossSeries = 0;          // Счетчик серии убытков
 double BaseLot = 0.01;       // Базовый лот
@@ -1078,7 +1079,6 @@ if(!CanTradeToday())
    CancelAllPendings(); // снимаем висячие ордера
    return; // выходим из OnTick — дальше логика не выполняется
 }
-
    // Восстановленная логика без убытка (из v2.01)
    CheckNoLoss();
    if (!AllowTradeAfterLoss)
@@ -1090,10 +1090,9 @@ if(!CanTradeToday())
       }
       else return;
    }
-   
+  
    double currentLot = NormalizeDouble(BaseLot * MathPow(1.5, LossSeries), 2);
    if (currentLot > MarketInfo(Symbol(), MODE_MAXLOT)) currentLot = MarketInfo(Symbol(), MODE_MAXLOT);
-
    bool noLine = NoLineModeActive();
    // --- PIN BAR LOGIC: приоритет ---
    SignalInfo sig = {false, false, "", 0.0, 0.0, 0.0, 0.0};
@@ -1104,7 +1103,11 @@ if(!CanTradeToday())
       }
    }
    if (noLine){
-      if (Debug) Print("[MODE=NoLine] Direction=",(CurrentTradeDir==OnlyBuy?"BUY":"SELL"));
+      int currentDir = (CurrentTradeDir==OnlyBuy)?1:(CurrentTradeDir==OnlySell)?-1:0;
+      if (currentDir != LastLoggedDirection) {
+         if (Debug) Print("[MODE=NoLine] Direction=",(CurrentTradeDir==OnlyBuy?"BUY":"SELL"));
+         LastLoggedDirection = currentDir;
+      }
       bool posExists = kOnePositionOnly && (CountOpenPositions()>0);
       if (!pinExecuted && UseABLimit && kNoLine_UsePending && !posExists && (new_h1_bar || PendingTicket==0))
          FindLatestPattern_NoLine();
