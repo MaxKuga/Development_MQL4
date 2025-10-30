@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                          TargetPoint_v2.05.mq4   |
+//|                                          TargetPoint_v2.04.mq4   |
 //|                        Copyright 2025, MetaQuotes Software Corp. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
@@ -9,6 +9,13 @@
 #property strict
 #property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
 
+// Переменные для логики без убытка (из v2.01)
+int LossSeries = 0;          // Счетчик серии убытков
+double BaseLot = 0.01;       // Базовый лот
+int MaxLossSeries = 3;       // Макс. серия убытков
+bool AllowTradeAfterLoss = false; // Флаг разрешения торговли после убытка
+datetime LastTradeTime = 0;  // Время последней сделки
+int TradeDirection = 0;      // Направление последней сделки (1-buy, -1-sell)
 // ====================== ENUMS =====================================
 enum TradeDirectionEnum { NoTrade = 0, OnlyBuy = 1, OnlySell = 2 };
 enum HLinePickModeEnum  { NearestToPrice = 0, LastCreated = 1 };
@@ -26,9 +33,8 @@ input TradeDirectionEnum InputTradeDir       = OnlyBuy; // Initial Trade Directi
 input double      RiskPercent                = 1.0;     // Risk %
 input double      SL_Percent                 = 0.25;    // SL % ATR(D1)
 input double      TP_RR                      = 5.0;     // TP Risk Reward
-input BreakevenModeEnum BreakevenMode = BE_Standard;
-input double BreakevenSLMultiplier = 2.0;
-input int BreakevenOffsetPoints = 10;
+input double BreakevenSLMultiplier           = 2.0; // Breakeven SL Multiplier (for BE_Standard)
+extern int BreakevenOffsetPoints             = 10;   // Breakeven Offset
 input int         MaxLosingTradesPerDay      = 1;       // Max loss trades/day (0 = no limit)
 // Паттерны (единый список)
 input bool        UseABLimit                 = true;    // Use AB Limit pattern
@@ -127,6 +133,8 @@ const bool   kNoLine_UseMarket             = true;
 // Визуал
 const color  kImpulseBullDotColor          = clrLime;
 const color  kImpulseBearDotColor          = clrRed;
+// BE offset скрыт из меню
+const int    kBreakevenOffsetPoints        = 10;        // скрытый дефолт
 // ====================== КНОПКИ ДИРЕКШНА ===========================
 const string kBuyButtonName      = "TP_BUY_BTN";
 const string kSellButtonName     = "TP_SELL_BTN";
@@ -322,10 +330,10 @@ void UpdateBreakevenMode(){
    bool hasDashed = HasDashedLine();
    if(hasDashed && CurrentBreakevenMode != BE_ByDashedHLine){
       CurrentBreakevenMode = BE_ByDashedHLine;
-      if(Debug) Print("Breakeven mode -> BE_ByDashedHLine");
+      if (Debug) Print("Dashed line detected. Breakeven mode switched to BE_ByDashedHLine.");
    }else if(!hasDashed && CurrentBreakevenMode != BE_Standard){
       CurrentBreakevenMode = BE_Standard;
-      if(Debug) Print("Breakeven mode -> BE_Standard");
+      if (Debug) Print("No dashed line. Breakeven mode switched back to BE_Standard.");
    }
 }
 
@@ -397,7 +405,7 @@ void ManageBreakevenByLine(){
       int ticket=OrderTicket();
       double entry=OrderOpenPrice();
       double tp=OrderTakeProfit();
-      double offset=BreakevenOffsetPoints*Point;
+      double offset=kBreakevenOffsetPoints*Point;
 
       if(IsBEDone(ticket)) continue;
       if(WasJustActivated(ticket)) continue;
@@ -426,55 +434,6 @@ void ManageBreakevenByLine(){
             AddBEDone(ticket);
          }else{
             Print("[BE-Line] Error setting breakeven: ",GetLastError()," ticket=",ticket);
-         }
-      }
-   }
-}
-//+------------------------------------------------------------------+
-//| Manage breakeven (standard)                                      |
-//+------------------------------------------------------------------+
-void ManageBreakeven_Standard(){
-   if(BreakevenSLMultiplier<=0.0) return;
-   for(int i=OrdersTotal()-1;i>=0;i--){
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
-      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
-
-      int type=OrderType();
-      if(type!=OP_BUY && type!=OP_SELL) continue;
-
-      int ticket=OrderTicket();
-      if(IsBEDone(ticket)) continue;
-      if(WasJustActivated(ticket)) continue;
-
-      double entry=OrderOpenPrice();
-      double sl=OrderStopLoss();
-      if(sl<=0.0) continue;
-
-      double sl_dist=MathAbs(entry-sl);
-      if(sl_dist<=2*Point) continue;
-
-      double trigger_dist=BreakevenSLMultiplier*sl_dist;
-      double offset=BreakevenOffsetPoints*Point;
-
-      if(type==OP_BUY){
-         if((Bid-entry)>=trigger_dist){
-            double newSL=NormalizeDouble(entry+offset,Digits);
-            newSL=MathMin(newSL,Bid-2*Point);
-            if(newSL>OrderStopLoss()){
-               if(OrderModify(ticket,entry,newSL,OrderTakeProfit(),0,clrNONE)){
-                  AddBEDone(ticket);
-               }
-            }
-         }
-      }else{
-         if((entry-Ask)>=trigger_dist){
-            double newSL=NormalizeDouble(entry-offset,Digits);
-            newSL=MathMax(newSL,Ask+2*Point);
-            if(OrderStopLoss()==0 || newSL<OrderStopLoss()){
-               if(OrderModify(ticket,entry,newSL,OrderTakeProfit(),0,clrNONE)){
-                  AddBEDone(ticket);
-               }
-            }
          }
       }
    }
@@ -964,35 +923,35 @@ bool ExecuteSignal_PinBar(const SignalInfo &sig){
       return false;
    }
 }
-
-
 //+------------------------------------------------------------------+
-//| Expert initialization      OnInit                                |
+//| Expert initialization OnInit                                     |
 //+------------------------------------------------------------------+
 int OnInit(){
    CurrentTradeDir = InputTradeDir;
    CurrentBreakevenMode = BE_Standard; // авто-переключение через UpdateBreakevenMode()
-
    int h1_period = MathMax(H1_AvgRangePeriod,1);
    int d1_period = MathMax(D1_AvgRangePeriod,1);
    if (h1_period!=H1_AvgRangePeriod || d1_period!=D1_AvgRangePeriod)
       Print("Warning: AvgRangePeriod forced to minimum 1.");
-
    CloseZone = CloseZonePercent/100.0;
-
    UpdateLineLevel();
    UpdateBreakevenMode();
    UpdateLimitLine();
    if(ShowImpulseDots) DrawAllImpulseDots();
    CreateDirectionButtons();
-
    UsedKeysCount = 0;
-
    // Инициализация для DailyExtremeBreak
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    CurrentDay = TimeCurrent() - (dt.hour * 3600 + dt.min * 60 + dt.sec); // Начало текущего дня
-
+   
+   // Инициализация логики без убытка (из v2.01)
+   LossSeries = 0;
+   BaseLot = MarketInfo(Symbol(), MODE_MINLOT);
+   AllowTradeAfterLoss = true;
+   LastTradeTime = 0;
+   TradeDirection = 0;
+   
    return(INIT_SUCCEEDED);
 }
 void OnDeinit(const int reason){
@@ -1004,7 +963,6 @@ void OnDeinit(const int reason){
    ObjectDelete(0,kCloseAllButtonName);
    ObjectDelete(0,LimitLineName);
    ObjectDelete(0,"TP_BE_LINE");
-
    string prefix="ImpulseDot_";
    for(int i=ObjectsTotal()-1;i>=0;i--){
       string name=ObjectName(i);
@@ -1013,10 +971,9 @@ void OnDeinit(const int reason){
 }
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam){
    if (id==CHARTEVENT_OBJECT_CLICK){
-      if (sparam==kBuyButtonName){  CurrentTradeDir=OnlyBuy;  UpdateButtonColors(); ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false); }
+      if (sparam==kBuyButtonName){ CurrentTradeDir=OnlyBuy; UpdateButtonColors(); ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false); }
       if (sparam==kSellButtonName){ CurrentTradeDir=OnlySell; UpdateButtonColors(); ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false); }
-      if (sparam==kOffButtonName){  CurrentTradeDir=NoTrade;  UpdateButtonColors(); ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false); }
-
+      if (sparam==kOffButtonName){ CurrentTradeDir=NoTrade; UpdateButtonColors(); ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false); }
       if (sparam==kBEButtonName){
          double pip = PipSize();
          double offset = 30.0 * pip;
@@ -1035,11 +992,46 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
          CreateLimitLine();
          ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
       }
-
       if (sparam==kCloseAllButtonName){
          CloseAll();
          ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
       }
+   }
+}
+// Функция проверки и обновления логики без убытка (из v2.01)
+bool CheckNoLoss()
+{
+   if (OrdersHistoryTotal() == 0) return true;
+   
+   int lastOrder = -1;
+   for (int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY) && OrderSymbol() == Symbol())
+      {
+         lastOrder = i;
+         break;
+      }
+   }
+   
+   if (lastOrder == -1) return true;
+   
+   OrderSelect(lastOrder, SELECT_BY_POS, MODE_HISTORY);
+   if (OrderProfit() > 0)
+   {
+      LossSeries = 0;
+      AllowTradeAfterLoss = true;
+      return true;
+   }
+   else
+   {
+      LossSeries++;
+      if (LossSeries >= MaxLossSeries)
+      {
+         AllowTradeAfterLoss = false;
+         return false;
+      }
+      AllowTradeAfterLoss = true;
+      return true;
    }
 }
 //+------------------------------------------------------------------+
@@ -1047,23 +1039,17 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
 //+------------------------------------------------------------------+
 void OnTick(){
    CheckButtonStates();
-EnforceDailyLossLimit();
+   EnforceDailyLossLimit();
    if (CurrentTradeDir == NoTrade) return;
-
    double spread=(Ask-Bid)/Point;
    if (kMaxSpreadPoints>0 && spread>kMaxSpreadPoints){ if (Debug) Print("Spread too high: ",spread," > ",kMaxSpreadPoints); return; }
-
    CalculateATRs();
-
    datetime current_h1_time=iTime(NULL,PERIOD_H1,0);
    bool new_h1_bar = (current_h1_time!=LastH1BarTime);
    if (new_h1_bar) LastH1BarTime=current_h1_time;
-
    UpdateBreakevenMode();
-   if(CurrentBreakevenMode==BE_ByDashedHLine)  ManageBreakevenByLine();
-   else                                        ManageBreakeven_Standard();
-
-
+   UpdateLimitLine();
+   CheckLimitTouch();
    // Новый день — ресет
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
@@ -1075,13 +1061,11 @@ EnforceDailyLossLimit();
       if (Debug) Print("[DailyExtremeBreak] New day started. Reset signal candles.");
       CancelAllPendings();
    }
-
    // Проверка на прибыльные сделки
    if (HasProfitableTradeToday()) {
       if (Debug) Print("Profitable trade today. No further trading.");
       return;
    }
-
    // Лимит убыточных сделок
    if (MaxGapBarsBetweenSignals > 0 && CountLosingTradesToday() >= MaxGapBarsBetweenSignals) {
       // Внимание: оставлено как есть из исходной логики суточного контроля (если хотим — можно вынести отдельный input)
@@ -1091,11 +1075,26 @@ if(!CanTradeToday())
 {
    if(Debug) Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
                    CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
-   CancelAllPendings();   // снимаем висящие ордера
-   return;                // выходим из OnTick — дальше логика не выполняется
+   CancelAllPendings(); // снимаем висячие ордера
+   return; // выходим из OnTick — дальше логика не выполняется
 }
-   bool noLine = NoLineModeActive();
 
+   // Восстановленная логика без убытка (из v2.01)
+   CheckNoLoss();
+   if (!AllowTradeAfterLoss)
+   {
+      if (TimeCurrent() - LastTradeTime > 3600) // Разрешить через час
+      {
+         LossSeries = 0;
+         AllowTradeAfterLoss = true;
+      }
+      else return;
+   }
+   
+   double currentLot = NormalizeDouble(BaseLot * MathPow(1.5, LossSeries), 2);
+   if (currentLot > MarketInfo(Symbol(), MODE_MAXLOT)) currentLot = MarketInfo(Symbol(), MODE_MAXLOT);
+
+   bool noLine = NoLineModeActive();
    // --- PIN BAR LOGIC: приоритет ---
    SignalInfo sig = {false, false, "", 0.0, 0.0, 0.0, 0.0};
    bool pinExecuted = false;
@@ -1104,26 +1103,25 @@ if(!CanTradeToday())
          pinExecuted = ExecuteSignal_PinBar(sig);
       }
    }
-
    if (noLine){
       if (Debug) Print("[MODE=NoLine] Direction=",(CurrentTradeDir==OnlyBuy?"BUY":"SELL"));
       bool posExists = kOnePositionOnly && (CountOpenPositions()>0);
-
       if (!pinExecuted && UseABLimit && kNoLine_UsePending && !posExists && (new_h1_bar || PendingTicket==0))
          FindLatestPattern_NoLine();
-
       if (!pinExecuted && UseABMarket && kNoLine_UseMarket && !posExists && PendingTicket==0){
          int barA_shift,barB_shift; double entry,sl,tp;
          if (CheckNewPattern_NoLine(CurrentTradeDir==OnlyBuy,barA_shift,barB_shift,entry,sl,tp)){
             int type=(CurrentTradeDir==OnlyBuy)?OP_BUY:OP_SELL;
             if (IsDirectionAllowed(type)){
-               double lot=CalculateLot(entry,sl);
+               double lot=currentLot;
                if (lot>0){
                   string cmt=StringFormat("NoLineMKT|PK:%s",CurrentPattern.Key);
                   int tk=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,(type==OP_BUY?clrGreen:clrRed));
                   if (tk>0){
                      AddUsedKey(CurrentPattern.Key);
                      if (kOnePositionOnly) CancelAllPendings();
+                     LastTradeTime = TimeCurrent();
+                     TradeDirection = (type==OP_BUY)?1:-1;
                      if (Debug) Print("[NoLine] Market entry executed. Key=",CurrentPattern.Key);
                   }else{
                      Print("[NoLine] Market entry error: ",GetLastError());
@@ -1132,23 +1130,19 @@ if(!CanTradeToday())
             }
          }
       }
-
       if (!pinExecuted && UseDailyExtremeBreak && new_h1_bar && !posExists && PendingTicket==0) {
          UpdateAndCheckDailyExtreme_NoLine();
       }
-
       ManagePending();
       if (CurrentBreakevenMode==BE_Standard) ManageBreakeven_Standard(); else ManageBreakevenByLine();
       if (new_h1_bar && ShowImpulseDots) DrawNewImpulseDot(1);
       DrawHUD_NoLine();
-
       if (kOnePositionOnly && CountOpenPositions()==0 && PendingTicket==0){
          CurrentPattern.A_shift=-1; CurrentPattern.B_shift=-1; CurrentPattern.OpenA=0.0;
-         CurrentPattern.A_time=0;  CurrentPattern.B_time=0;
+         CurrentPattern.A_time=0; CurrentPattern.B_time=0;
          CurrentPattern.Key = "";
          if (Debug) Print("[RESET] No open trades. Search unlocked for new patterns.");
       }
-
       g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
       return;
    }
@@ -1852,6 +1846,41 @@ void ManagePending(){
       PendingPatternKey = "";
    }
 }
+
+//+------------------------------------------------------------------+
+//| Manage breakeven (standard)                                      |
+//+------------------------------------------------------------------+
+void ManageBreakeven_Standard(){
+   for (int i=OrdersTotal()-1;i>=0;i--){
+      if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if (OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      if (OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
+      int ticket=OrderTicket();
+      if (IsBEDone(ticket)) continue;
+      double entry=OrderOpenPrice();
+      double sl =OrderStopLoss();
+      double sl_dist = MathAbs(entry-sl);
+      double sl_points = sl_dist/Point;
+      double profitPoints = (OrderType()==OP_BUY ? (Bid-entry)/Point : (entry-Ask)/Point);
+      if (profitPoints >= sl_points * BreakevenSLMultiplier){
+         double newSL = NormalizeDouble(entry + (OrderType()==OP_BUY ? kBreakevenOffsetPoints*Point : -kBreakevenOffsetPoints*Point), Digits);
+         if ((OrderType()==OP_BUY && (sl==0 || newSL>sl)) || (OrderType()==OP_SELL && (sl==0 || newSL<sl))){
+            double tp=OrderTakeProfit();
+            if (OrderModify(ticket,entry,newSL,tp,0,clrGreen)){
+               Print("Breakeven set for ticket ",ticket);
+               AddBEDone(ticket);
+            }else{
+               Print("Error setting breakeven: ",GetLastError());
+            }
+         }
+      }
+   }
+}
+bool IsBEDone(int ticket){ for (int i=0;i<BE_DoneCount;i++){ if (BE_DoneTickets[i]==ticket) return true; } return false; }
+void AddBEDone(int ticket){ if (BE_DoneCount<ArraySize(BE_DoneTickets)){ BE_DoneTickets[BE_DoneCount]=ticket; BE_DoneCount++; } }
+bool WasJustActivated(int ticket,int seconds_grace=2){ if(!OrderSelect(ticket,SELECT_BY_TICKET)) return false; return (TimeCurrent()-OrderOpenTime()<=seconds_grace); }
+bool CrossedUp(double level){ if(!g_prevInited) return false; return (g_prevBid<level && Bid>=level); }
+bool CrossedDown(double level){ if(!g_prevInited) return false; return (g_prevAsk>level && Ask<=level); }
 //+------------------------------------------------------------------+
 //| Impulse Dots Visualization                                       |
 //+------------------------------------------------------------------+
@@ -2255,33 +2284,5 @@ if(!CanTradeToday())
    } else {
       Print("[DailyExtremeBreak] Error placing pending: ", GetLastError());
    }
-}
-bool IsBEDone(int ticket){
-   for(int i=0;i<BE_DoneCount;i++){
-      if(BE_DoneTickets[i]==ticket) return true;
-   }
-   return false;
-}
-
-void AddBEDone(int ticket){
-   if(BE_DoneCount<ArraySize(BE_DoneTickets)){
-      BE_DoneTickets[BE_DoneCount]=ticket;
-      BE_DoneCount++;
-   }
-}
-
-bool WasJustActivated(int ticket,int seconds_grace=2){
-   if(!OrderSelect(ticket,SELECT_BY_TICKET)) return false;
-   return (TimeCurrent()-OrderOpenTime()<=seconds_grace);
-}
-
-bool CrossedUp(double level){
-   if(!g_prevInited) return false;
-   return (g_prevBid<level && Bid>=level);
-}
-
-bool CrossedDown(double level){
-   if(!g_prevInited) return false;
-   return (g_prevAsk>level && Ask<=level);
 }
 //+------------------------------------------------------------------+
