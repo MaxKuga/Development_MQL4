@@ -2137,11 +2137,15 @@ void UpdateAndCheckDailyExtreme(bool lineMode) {
    bool high_in_window = (hi_shift != -1 && IsInSession(hi_time));
    bool low_in_window  = (lo_shift != -1 && IsInSession(lo_time));
 
-   if (Debug){
-      PrintFormat("[DEB][D1] dayStart=%s  High=%.5f (t=%s, inWin=%s)  Low=%.5f (t=%s, inWin=%s)",
+      static datetime lastD1Log = 0;
+   datetime today = TimeCurrent() / 86400 * 86400;
+   if(Debug && lastD1Log < today)
+   {
+      PrintFormat("[DEB][D1] dayStart=%s High=%.5f (t=%s, inWin=%s) Low=%.5f (t=%s, inWin=%s)",
          TimeToString(dayStart, TIME_DATE|TIME_MINUTES),
          dayHighD1, TimeToString(hi_time, TIME_DATE|TIME_MINUTES), high_in_window?"Y":"N",
-         dayLowD1,  TimeToString(lo_time, TIME_DATE|TIME_MINUTES), low_in_window ?"Y":"N");
+         dayLowD1, TimeToString(lo_time, TIME_DATE|TIME_MINUTES), low_in_window ?"Y":"N");
+      lastD1Log = today;
    }
 
    if (CurrentTradeDir == OnlySell){
