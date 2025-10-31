@@ -27,7 +27,7 @@ int      CountLosingTradesToday();
 bool     CanTradeToday();
 void     EnforceDailyLossLimit();
 
-// ====================== INPUTS (упрощённые) =======================
+// ====================== INPUTS =======================
 // Направление
 input TradeDirectionEnum InputTradeDir       = OnlyBuy; // Initial Trade Direction
 // Риск/SL/TP
@@ -37,7 +37,7 @@ input double      TP_RR                      = 5.0;     // TP Risk Reward
 input double BreakevenSLMultiplier           = 2.0; // Breakeven SL Multiplier (for BE_Standard)
 extern int BreakevenOffsetPoints             = 10;   // Breakeven Offset
 input int         MaxLosingTradesPerDay      = 1;       // Max loss trades/day (0 = no limit)
-// Паттерны (единый список)
+// Паттерны 
 input bool        UseABLimit                 = true;    // Use AB Limit pattern
 input bool        UseABMarket                = true;    // Use AB Market pattern
 input bool        UseDailyExtremeBreak       = true;    // Use DailyExtremeBreak pattern
@@ -67,6 +67,7 @@ input int         EndHour                    = 22;      // End hour
 input int         EndMinute                  = 0;       // End minute
 // Pin Bar только режим источника SL (без отдельного коэффициента ATR)
 input StopModeEnum PinBarStopMode            = SL_LocalExtreme; // Pin Bar SL source
+
 // === Day helpers & daily loss limit =================================
 datetime DayStartServer() { return iTime(Symbol(), PERIOD_D1, 0); } // старт дня по времени брокера
 
@@ -171,6 +172,8 @@ struct Pattern {
    datetime B_time;
    string Key;
 };
+static int lastPendingManageTicket = 0;
+
 Pattern CurrentPattern = { -1, -1, 0.0, 0, 0, "" };
 
 // --- PIN BAR LOGIC ---
@@ -1063,8 +1066,13 @@ void OnTick(){
       CancelAllPendings();
    }
    // Проверка на прибыльные сделки
+   static datetime lastProfitableLog = 0;
+   datetime today = TimeCurrent() / 86400 * 86400;
    if (HasProfitableTradeToday()) {
-      if (Debug) Print("Profitable trade today. No further trading.");
+      if(lastProfitableLog < today && Debug) {
+         Print("Profitable trade today. No further trading.");
+         lastProfitableLog = today;
+      }
       return;
    }
    // Лимит убыточных сделок
@@ -1072,13 +1080,15 @@ void OnTick(){
       // Внимание: оставлено как есть из исходной логики суточного контроля (если хотим — можно вынести отдельный input)
    }
 // ⛔️ DAILY LOSS LIMIT — глобальный стоп торговли на день
-if(!CanTradeToday())
-{
-   if(Debug) Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
-                   CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
-   CancelAllPendings(); // снимаем висячие ордера
-   return; // выходим из OnTick — дальше логика не выполняется
-}
+   static datetime lastLossLimitLog = 0;
+   if(!CanTradeToday())
+   {
+      if(lastLossLimitLog < today && Debug) Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
+                      CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
+      lastLossLimitLog = today;
+      CancelAllPendings(); // снимаем висячие ордера
+      return; // выходим из OnTick — дальше логика не выполняется
+   }
    // Восстановленная логика без убытка (из v2.01)
    CheckNoLoss();
    if (!AllowTradeAfterLoss)
@@ -1109,30 +1119,28 @@ if(!CanTradeToday())
          LastLoggedDirection = currentDir;
       }
       bool posExists = kOnePositionOnly && (CountOpenPositions()>0);
-      if (!pinExecuted && UseABLimit && kNoLine_UsePending && !posExists && (new_h1_bar || PendingTicket==0))
-         FindLatestPattern_NoLine();
       if (!pinExecuted && UseABMarket && kNoLine_UseMarket && !posExists && PendingTicket==0){
-         int barA_shift,barB_shift; double entry,sl,tp;
-         if (CheckNewPattern_NoLine(CurrentTradeDir==OnlyBuy,barA_shift,barB_shift,entry,sl,tp)){
-            int type=(CurrentTradeDir==OnlyBuy)?OP_BUY:OP_SELL;
-            if (IsDirectionAllowed(type)){
-               double lot=currentLot;
-               if (lot>0){
-                  string cmt=StringFormat("NoLineMKT|PK:%s",CurrentPattern.Key);
-                  int tk=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,(type==OP_BUY?clrGreen:clrRed));
-                  if (tk>0){
-                     AddUsedKey(CurrentPattern.Key);
-                     if (kOnePositionOnly) CancelAllPendings();
-                     LastTradeTime = TimeCurrent();
-                     TradeDirection = (type==OP_BUY)?1:-1;
-                     if (Debug) Print("[NoLine] Market entry executed. Key=",CurrentPattern.Key);
-                  }else{
-                     Print("[NoLine] Market entry error: ",GetLastError());
-                  }
-               }
+   int barA_shift,barB_shift; double entry,sl,tp;
+   if (CheckNewPattern_NoLine(CurrentTradeDir==OnlyBuy,barA_shift,barB_shift,entry,sl,tp)){
+      int type=(CurrentTradeDir==OnlyBuy)?OP_BUY:OP_SELL;
+      if (IsDirectionAllowed(type)){
+         double lot = currentLot;
+         if (lot>0){
+            string cmt=StringFormat("NoLineMKT|PK:%s",CurrentPattern.Key);
+            int tk=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,(type==OP_BUY?clrGreen:clrRed));
+            if (tk>0){
+               AddUsedKey(CurrentPattern.Key);
+               if (kOnePositionOnly) CancelAllPendings();
+               LastTradeTime = TimeCurrent();
+               TradeDirection = (type==OP_BUY)?1:-1;
+               if (Debug) Print("[NoLine] Market entry executed. Key=",CurrentPattern.Key);
+            }else{
+               Print("[NoLine] Market entry error: ",GetLastError());
             }
          }
       }
+   }
+}
       if (!pinExecuted && UseDailyExtremeBreak && new_h1_bar && !posExists && PendingTicket==0) {
          UpdateAndCheckDailyExtreme_NoLine();
       }
@@ -1145,15 +1153,15 @@ if(!CanTradeToday())
          CurrentPattern.A_time=0; CurrentPattern.B_time=0;
          CurrentPattern.Key = "";
          static datetime lastResetLog = 0;
-         datetime today = TimeCurrent() / 86400 * 86400;
          if(lastResetLog < today){
             if (Debug) Print("[RESET] No open trades. Search unlocked for new patterns.");
             lastResetLog = today;
          }
       }
-      g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
+            g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
       return;
    }
+   
    // ----------------------------------------------------------- 
    //                      LINE MODE                           //                 
    // -----------------------------------------------------------
@@ -1812,46 +1820,51 @@ double CalculateLot(double entry,double sl){
 //+------------------------------------------------------------------+
 //| Manage pending (expiry = MaxGapBarsBetweenSignals)               |
 //+------------------------------------------------------------------+
-void ManagePending(){
-   if (kOnePositionOnly && CountOpenPositions()>0){
-      if (PendingTicket>0 && OrderSelect(PendingTicket,SELECT_BY_TICKET) &&
-          (OrderType()==OP_BUYLIMIT || OrderType()==OP_SELLLIMIT || OrderType()==OP_BUYSTOP || OrderType()==OP_SELLSTOP)){
-         if (!OrderDelete(PendingTicket)) Print("ManagePending: fail delete pending ",GetLastError());
-         PendingTicket=0;
-         PendingPatternKey = "";
+void ManagePending()
+{
+   if(PendingTicket <= 0) return;
+   if(CountOpenPositions() > 0) return;
+   
+   bool found = false;
+   for(int i=0; i<OrdersTotal(); i++)
+   {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES))
+      {
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MagicNumber && OrderTicket()==PendingTicket)
+         {
+            found = true;
+            break;
+         }
       }
-      CancelAllPendings();
+   }
+   if(!found)
+   {
+      PendingTicket = 0;
       return;
    }
 
-   if (PendingTicket<=0) return;
-   if (!OrderSelect(PendingTicket,SELECT_BY_TICKET)){ PendingTicket=0; PendingPatternKey = ""; return; }
+   int barsSincePlace = iBarShift(NULL, PERIOD_H1, OrderOpenTime());
+      int expiryBars = MaxGapBarsBetweenSignals;
+   int currentH1Bars = iBars(NULL, PERIOD_H1);
+   int placeIndex = currentH1Bars - barsSincePlace - 1;
 
-   if (OrderType()!=OP_BUYLIMIT && OrderType()!=OP_SELLLIMIT){
-      string k=PendingPatternKey;
-      if (k==""){
-         string cmt=OrderComment();
-         if (!TryParseKeyFromComment(cmt,k)) k="";
-      }
-      if (k!="") AddUsedKey(k);
-
-      PendingTicket=0;
-      PendingPatternKey = "";
-      Print("Pending activated to position.");
-      return;
+   static datetime lastManageLog = 0;
+   if(lastManageLog == 0 || (PendingTicket != lastPendingManageTicket))
+   {
+      if(Debug) Print("[ManagePending] Ticket=",PendingTicket,", Bars since place=",barsSincePlace,
+                      ", Expiry bars=",expiryBars,", H1 bars=",currentH1Bars,", PlaceIndex=",placeIndex);
+      lastManageLog = TimeCurrent();
+      lastPendingManageTicket = PendingTicket;
    }
 
-   int bars_since_place = iBars(NULL,PERIOD_H1) - PendingPlaceH1BarIndex;
-   int expiryBars = MaxGapBarsBetweenSignals;
-   if (Debug) PrintFormat("[ManagePending] Ticket=%d, Bars since place=%d, Expiry bars=%d, H1 bars=%d, PlaceIndex=%d",
-                         PendingTicket, bars_since_place, expiryBars, iBars(NULL,PERIOD_H1), PendingPlaceH1BarIndex);
-   if (expiryBars>0 && bars_since_place >= expiryBars){
-      string k = PendingPatternKey;
-      if (k != "") AddUsedKey(k);
-      if (OrderDelete(PendingTicket)) Print("Pending expired and deleted. Pattern key added to used: ", k);
-      else Print("Error deleting expired pending: ", GetLastError());
-      PendingTicket=0;
-      PendingPatternKey = "";
+   if(barsSincePlace >= expiryBars)
+   {
+      if(OrderDelete(PendingTicket))
+      {
+         if(Debug) Print("[ManagePending] Expired pending order deleted. Ticket=",PendingTicket);
+         PendingTicket = 0;
+      }
+      else Print("[ManagePending] Delete error: ",GetLastError());
    }
 }
 
