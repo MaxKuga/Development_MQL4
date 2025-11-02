@@ -1,16 +1,15 @@
 //+------------------------------------------------------------------+
-//|                                          TargetPoint_v2.06.mq4   |
+//|                                          TargetPoint_v2.07.mq4   |
 //|                        Copyright 2025, MetaQuotes Software Corp. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Built by MaximK"
 #property link      ""
-#property version   "2.04"
+#property version   "2.07"
 #property strict
 #property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
 
 int LastLoggedDirection = 0; // Последнее залогированное направление (1=OnlyBuy, -1=OnlySell)
-// Переменные для логики без убытка (из v2.01)
 int LossSeries = 0;          // Счетчик серии убытков
 double BaseLot = 0.01;       // Базовый лот
 int MaxLossSeries = 3;       // Макс. серия убытков
@@ -34,8 +33,8 @@ input TradeDirectionEnum InputTradeDir       = OnlyBuy; // Initial Trade Directi
 input double      RiskPercent                = 1.0;     // Risk %
 input double      SL_Percent                 = 0.25;    // SL % ATR(D1)
 input double      TP_RR                      = 5.0;     // TP Risk Reward
-input double BreakevenSLMultiplier           = 2.0; // Breakeven SL Multiplier (for BE_Standard)
-extern int BreakevenOffsetPoints             = 10;   // Breakeven Offset
+input double BreakevenSLMultiplier           = 2.0;     // Breakeven SL Multiplier 
+extern int BreakevenOffsetPoints             = 10;      // Breakeven Offset
 input int         MaxLosingTradesPerDay      = 1;       // Max loss trades/day (0 = no limit)
 // Паттерны 
 input bool        UseABLimit                 = true;    // Use AB Limit pattern
