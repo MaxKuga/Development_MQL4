@@ -287,6 +287,35 @@ bool IsDirectionAllowed(int type){
    return (CurrentTradeDir!=NoTrade);
 }
 
+bool IsBreakevenProfitOrder(){
+   if (OrderProfit() <= 0) return false;
+
+   int type = OrderType();
+   if (type != OP_BUY && type != OP_SELL) return false;
+
+   double stopLoss = OrderStopLoss();
+   if (stopLoss <= 0) return false;
+
+   double closePrice = OrderClosePrice();
+   double openPrice  = OrderOpenPrice();
+   double priceTolerance = Point * 5; // допуск для учета проскальзывания
+
+   bool closedByStop = (MathAbs(closePrice - stopLoss) <= priceTolerance);
+   if (!closedByStop) return false;
+
+   double stopDeltaPoints = MathAbs(stopLoss - openPrice) / Point;
+   double expectedOffset  = kBreakevenOffsetPoints;
+   double tolerancePoints = 3;
+   double minPoints = MathMax(0.0, expectedOffset - tolerancePoints);
+
+   bool nearExpectedOffset = (stopDeltaPoints >= minPoints &&
+                              stopDeltaPoints <= expectedOffset + tolerancePoints);
+
+   if (IsBEDone(OrderTicket())) return true;
+
+   return nearExpectedOffset;
+}
+
 // Проверка, была ли прибыльная сделка сегодня
 bool HasProfitableTradeToday() {
    MqlDateTime dt;
@@ -297,7 +326,10 @@ bool HasProfitableTradeToday() {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
       if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
       if(OrderCloseTime() < today_start) continue;
-      if(OrderProfit() > 0) return true;
+      if(OrderProfit() > 0){
+         if(IsBreakevenProfitOrder()) continue;
+         return true;
+      }
    }
    return false;
 }
