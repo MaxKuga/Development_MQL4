@@ -590,7 +590,9 @@ void CheckLimitTouch(){
          }
       }
    }
-void LogTPEvent(const string &msg, ulong &lastTick){
+}
+
+void LogTPEvent(const string msg, ulong &lastTick){
    if(!Debug) return;
    ulong now = GetTickCount();
    if(now == lastTick) return;
@@ -794,170 +796,6 @@ void RestoreTPToRR(){
    if(!attempted || !failed){
       TPOverridePendingRestore = false;
    }
-}
-
-void HandleTPOverrideOnTick(){
-   if(TPOverrideActive){
-      ApplyTPOverride();
-   }else if(TPOverridePendingRestore){
-      RestoreTPToRR();
-     
-   }
-}
-
-   }else{
-      price = Ask + distance;
-   }
-   return NormalizeDouble(price, Digits);
-
-void CreateTPOverrideLine(){
-   if(ObjectFind(0,kTPOverrideLineName) >= 0) return;
-
-   TradeDirectionEnum dir = DetectTPOverrideDirection();
-   double price = ComputeTPLinePrice(dir);
-   if(price <= 0.0) return;
-
-   if(!ObjectCreate(0, kTPOverrideLineName, OBJ_HLINE, 0, 0, price)){
-      Print("Failed to create TP override line. err=", GetLastError());
-      return;
-   }
-   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_STYLE, STYLE_DASH);
-   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_COLOR, clrRed);
-   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_WIDTH, 1);
-
-   TPOverrideLevel = price;
-   TPOverrideActive = true;
-   TPOverridePendingRestore = false;
-   ChartRedraw();
-
-   LogTPEvent("TP LINE CREATED, price=" + DoubleToStr(price, Digits), g_tpLineCreatedLogTick);
-}
-
-void RemoveTPOverrideLine(){
-   bool hadLine = (ObjectFind(0,kTPOverrideLineName) >= 0);
-   if(hadLine){
-      if(!ObjectDelete(0, kTPOverrideLineName)){
-         Print("Failed to delete TP override line. err=", GetLastError());
-      }else{
-         ChartRedraw();
-      }
-   }
-
-   if(TPOverrideActive || hadLine){
-      TPOverrideActive = false;
-      TPOverrideLevel = 0.0;
-      TPOverridePendingRestore = true;
-      LogTPEvent("TP LINE REMOVED", g_tpLineRemovedLogTick);
-   }
-}
-
-void ToggleTPOverrideLine(){
-   if(ObjectFind(0,kTPOverrideLineName) >= 0){
-      RemoveTPOverrideLine();
-   }else{
-      CreateTPOverrideLine();
-   }
-}
-
-void UpdateTPOverrideLineState(){
-   if(ObjectFind(0,kTPOverrideLineName) < 0){
-      if(TPOverrideActive){
-         TPOverrideActive = false;
-         TPOverrideLevel = 0.0;
-         TPOverridePendingRestore = true;
-         LogTPEvent("TP LINE REMOVED", g_tpLineRemovedLogTick);
-      }
-      return;
-   }
-
-   double price = NormalizeDouble(ObjectGetDouble(0, kTPOverrideLineName, OBJPROP_PRICE, 0), Digits);
-   TPOverrideLevel = price;
-   if(!TPOverrideActive){
-      TPOverrideActive = true;
-      TPOverridePendingRestore = false;
-   }
-}
-
-void ApplyTPOverride(){
-   if(!TPOverrideActive) return;
-
-   double target = TPOverrideLevel;
-   if(target <= 0.0) return;
-
-   bool modified = false;
-   for(int i=OrdersTotal()-1;i>=0;i--){
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
-      if(OrderSymbol()!=Symbol()) continue;
-      if(OrderMagicNumber()!=MagicNumber) continue;
-      int type = OrderType();
-      if(type!=OP_BUY && type!=OP_SELL) continue;
-
-      double entry = OrderOpenPrice();
-      double sl    = OrderStopLoss();
-      double newTP = NormalizeDouble(target, Digits);
-      double currentTP = OrderTakeProfit();
-      double tol = Point/2.0;
-
-      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
-
-      if(type==OP_BUY && newTP <= entry) continue;
-      if(type==OP_SELL && newTP >= entry) continue;
-
-      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE)){
-         modified = true;
-      }else{
-         Print("Failed to apply TP override for ticket ", OrderTicket(), " err=", GetLastError());
-      }
-   }
-
-   if(modified){
-      LogTPEvent("TP OVERRIDE APPLIED", g_tpOverrideAppliedLogTick);
-   }
-}
-
-void RestoreTPToRR(){
-   bool modified = false;
-   bool attempted = false;
-   bool failed = false;
-
-   for(int i=OrdersTotal()-1;i>=0;i--){
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
-      if(OrderSymbol()!=Symbol()) continue;
-      if(OrderMagicNumber()!=MagicNumber) continue;
-      int type = OrderType();
-      if(type!=OP_BUY && type!=OP_SELL) continue;
-
-      double entry = OrderOpenPrice();
-      double sl    = OrderStopLoss();
-      if(sl <= 0.0) continue;
-
-      double dist = MathAbs(entry - sl);
-      if(dist <= Point/2.0) continue;
-
-      double newTP = (type==OP_BUY) ? (entry + TP_RR * dist) : (entry - TP_RR * dist);
-      newTP = NormalizeDouble(newTP, Digits);
-
-      double currentTP = OrderTakeProfit();
-      double tol = Point/2.0;
-      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
-
-      attempted = true;
-      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE)){
-         modified = true;
-      }else{
-         failed = true;
-         Print("Failed to restore TP for ticket ", OrderTicket(), " err=", GetLastError());
-      }
-   }
-
-   if(modified){
-      LogTPEvent("TP RESTORED TO RR MODE", g_tpRestoredLogTick);
-   }
-
-   if(!attempted || !failed){
-      TPOverridePendingRestore = false;
-   }
-}
 
 void HandleTPOverrideOnTick(){
    if(TPOverrideActive){
@@ -966,8 +804,6 @@ void HandleTPOverrideOnTick(){
       RestoreTPToRR();
    }
 }
-              
-      
 //---------------------------------------------------
 // Кнопки направления                               |
 //---------------------------------------------------
