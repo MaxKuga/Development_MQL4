@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                          TargetPoint_v2.10.mq4   |
+//|                                          TargetPoint_v2.09.mq4   |
 //|                        Copyright 2025, MetaQuotes Software Corp. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
@@ -796,6 +796,7 @@ void RestoreTPToRR(){
    if(!attempted || !failed){
       TPOverridePendingRestore = false;
    }
+}
 
 void HandleTPOverrideOnTick(){
    if(TPOverrideActive){
