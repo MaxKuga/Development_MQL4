@@ -77,8 +77,8 @@ public:
 };
 
 // Глобальные объекты для проверки новых баров
-CIsNewBar *newBarWeekly;
-CIsNewBar *newBarMonthly;
+CIsNewBar *newBarWeekly = NULL;
+CIsNewBar *newBarMonthly = NULL;
 
 // --- Цветовые утилиты (MT4) ---------------------------------------
 int GetRValue(color c) { return (c & 0x0000FF); }
@@ -903,87 +903,91 @@ void UpdateMonthlyATRZones(MonthData &m, int idxMonth, MonthData &mm[], int tota
 }
 
 
-// Отрисовка ATR-зон
+// Отрисовка ATR-зон (неделя)
 void DrawWeeklyATRZones(WeekData &w, const string &baseName, color colUpperBase, color colLowerBase, bool createOnlyWhenMissing)
 {
    if(baseName == "") return;
-   if(w.atr <= 0.0) return;
+   if(w.atr <= 0.0)   return;
+
    double boxHeight = w.atr * WeeklyBoxHeightPct;
    if(boxHeight <= 0.0) return;
-
-   string upName = baseName + "_UpRect";
-   if(createOnlyWhenMissing && ObjectFind(0, upName) != -1)
-      return;
 
    datetime tLeft  = w.s;
    datetime tRight = w.isClosed ? w.e : EndOfBrokerWeek(w.s);
 
+   string upName = baseName + "_UpRect";
    string dnName = baseName + "_DnRect";
-   
-   CreateOrUpdateRectangle(upName, tLeft, w.upperZoneTop, tRight, w.upperZoneBottom, colUpperBase);
-   CreateOrUpdateRectangle(dnName, tLeft, w.lowerZoneTop, tRight, w.lowerZoneBottom, colLowerBase);   
+   string upTxt  = baseName + "_UpTxt";
+   string dnTxt  = baseName + "_DnTxt";
 
-   double upMid = 0.5 * (w.upperZoneTop + w.upperZoneBottom);
-   double dnMid = 0.5 * (w.lowerZoneTop + w.lowerZoneBottom);
-   
+   if(createOnlyWhenMissing)
+   {
+      bool upExists    = (ObjectFind(0, upName) != -1);
+      bool dnExists    = (ObjectFind(0, dnName) != -1);
+      bool upTxtExists = (ObjectFind(0, upTxt)  != -1);
+      bool dnTxtExists = (ObjectFind(0, dnTxt)  != -1);
+      if(upExists && dnExists && upTxtExists && dnTxtExists)
+         return;
+   }
+
+   CreateOrUpdateRectangle(upName, tLeft, w.upperZoneTop, tRight, w.upperZoneBottom, colUpperBase);
+   CreateOrUpdateRectangle(dnName, tLeft, w.lowerZoneTop, tRight, w.lowerZoneBottom, colLowerBase);
+
+   double upMid = w.upperZoneTop   - 0.5 * boxHeight;
+   double dnMid = w.lowerZoneBottom + 0.5 * boxHeight;
+
    int atrPts = (int)MathRound(w.atr / _Point);
    string wAtrStr = "W_ATR: " + IntegerToString(atrPts);
-   string upTxt = baseName + "_UpTxt";
-   string dnTxt = baseName + "_DnTxt";
 
    CreateOrUpdateText(upTxt, tLeft, upMid, wAtrStr, Darker(colUpperBase, 0.50));
    CreateOrUpdateText(dnTxt, tLeft, dnMid, wAtrStr, Darker(colLowerBase, 0.50));
-}   
-   if(!ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid))
-   { ObjectDelete(dnTxt); ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid); }
-   ObjectSetText(dnTxt, wAtrStr, 8, "Arial", Darker(colLowerBase, 0.50));
-   ObjectSetInteger(0, dnTxt, OBJPROP_BACK, true);
 }
-void DrawMonthlyATRZones(MonthData &m, int visualIndex, color colUpperBase, color colLowerBase)
+
+void DrawMonthlyATRZones(MonthData &m, const string &baseName, color colUpperBase, color colLowerBase, bool createOnlyWhenMissing)
 {
+   if(baseName == "") return;
    if(m.atr <= 0.0) return;
+
    double boxHeight = m.atr * MonthlyBoxHeightPct;
    if(boxHeight <= 0.0) return;
 
    datetime tLeft  = m.s;
    datetime tRight = m.isClosed ? m.e : EndOfMonth(m.s);
 
-   // Прямоугольники (заливка)
-   string upName = MPRE + "Up_" + IntegerToString(visualIndex);
-   string dnName = MPRE + "Dn_" + IntegerToString(visualIndex);
+   string upName = baseName + "_UpRect";
+   string dnName = baseName + "_DnRect";
+   string upTxt  = baseName + "_UpTxt";
+   string dnTxt  = baseName + "_DnTxt";
 
-   ObjectCreate(0, upName, OBJ_RECTANGLE, 0, tLeft, m.upperZoneTop, tRight, m.upperZoneBottom);
-   ObjectSetInteger(0, upName, OBJPROP_COLOR, colUpperBase);
-   ObjectSetInteger(0, upName, OBJPROP_BACK, true);
+   if(createOnlyWhenMissing)
+   {
+      bool upExists    = (ObjectFind(0, upName) != -1);
+      bool dnExists    = (ObjectFind(0, dnName) != -1);
+      bool upTxtExists = (ObjectFind(0, upTxt)  != -1);
+      bool dnTxtExists = (ObjectFind(0, dnTxt)  != -1);
+      if(upExists && dnExists && upTxtExists && dnTxtExists) return;
+   }
 
-   ObjectCreate(0, dnName, OBJ_RECTANGLE, 0, tLeft, m.lowerZoneTop, tRight, m.lowerZoneBottom);
-   ObjectSetInteger(0, dnName, OBJPROP_COLOR, colLowerBase);
-   ObjectSetInteger(0, dnName, OBJPROP_BACK, true);
+   CreateOrUpdateRectangle(upName, tLeft, m.upperZoneTop, tRight, m.upperZoneBottom, colUpperBase);
+   CreateOrUpdateRectangle(dnName, tLeft, m.lowerZoneTop, tRight, m.lowerZoneBottom, colLowerBase);
 
-   // Подписи Month_ATR на левом краю коробок
-   string upTxt = MPRE + "UpTxt_" + IntegerToString(visualIndex);
-   string dnTxt = MPRE + "DnTxt_" + IntegerToString(visualIndex);
+   double upMid = m.upperZoneTop - 0.5 * boxHeight;
+   double dnMid = m.lowerZoneBottom + 0.5 * boxHeight;
 
-   double upMid = 0.5 * (m.upperZoneTop + m.upperZoneBottom);
-   double dnMid = 0.5 * (m.lowerZoneTop + m.lowerZoneBottom);
+   int atrPts = (int)MathRound(m.atr / _Point);
+   string mAtrStr = "Month_ATR: " + IntegerToString(atrPts);
 
-   string mAtrStr = "Month_ATR: " + DoubleToString(NormalizeDouble(m.atr, Digits), Digits);
-
-   if(!ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid))
-   { ObjectDelete(upTxt); ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid); }
-   ObjectSetText(upTxt, mAtrStr, 8, "Arial", Darker(colUpperBase, 0.50));
-   ObjectSetInteger(0, upTxt, OBJPROP_BACK, true);
-
-   if(!ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid))
-   { ObjectDelete(dnTxt); ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid); }
-   ObjectSetText(dnTxt, mAtrStr, 8, "Arial", Darker(colLowerBase, 0.50));
-   ObjectSetInteger(0, dnTxt, OBJPROP_BACK, true);
+   CreateOrUpdateText(upTxt, tLeft, upMid, mAtrStr, Darker(colUpperBase, 0.50));
+   CreateOrUpdateText(dnTxt, tLeft, dnMid, mAtrStr, Darker(colLowerBase, 0.50));
 }
 
 
 // ======================= LIFECYCLE =================================
 int OnInit()
 {
+   if(newBarWeekly != NULL) { delete newBarWeekly; newBarWeekly = NULL; }
+   if(newBarMonthly != NULL) { delete newBarMonthly; newBarMonthly = NULL; }
+
    newBarWeekly = new CIsNewBar(Symbol(), PERIOD_W1);
    newBarMonthly = new CIsNewBar(Symbol(), PERIOD_MN1);
    return(INIT_SUCCEEDED);
@@ -996,8 +1000,8 @@ void OnDeinit(const int reason)
    ClearObjectsByPrefix(TPREF);
    ClearObjectsByPrefix(WPRE);
    ClearObjectsByPrefix(MPRE);
-   delete newBarWeekly;
-   delete newBarMonthly;
+   delete newBarWeekly; newBarWeekly = NULL;
+   delete newBarMonthly; newBarMonthly = NULL;
 }
 
 // ======================= MAIN CALC =================================
@@ -1020,7 +1024,7 @@ int OnCalculate(const int rates_total,
    ClearObjectsByPrefix(TPREF);
 
    // Собираем дни
-   DayData dd[]; int ddCount=0;
+   DayData dd[]; int ddCount = 0;
    BuildFinishedDays(rates_total, time, open, high, low, close, dd, ddCount);
    if(ddCount <= 0) return(rates_total);
 
@@ -1032,18 +1036,20 @@ int OnCalculate(const int rates_total,
       double o = dd[pos].o, c = dd[pos].c, h = dd[pos].h, l = dd[pos].l;
       datetime t1 = dd[pos].s, t2 = dd[pos].e;
       color body = (c >= o) ? BullBodyColor : BearBodyColor;
+
       DrawBodyAndBorder(PREFIX, k, t1, t2, o, c, body);
       DrawWicks(PREFIX, k, t1, t2, o, c, h, l, WickColor, WickWidth);
 
       if(ShowLabels)
       {
-         bool isBull=false; double textY=0.0;
+         bool isBull = false; double textY = 0.0;
          string tag = ClassifyDayAndLabel(pos, dd, ddCount, ImpAtrPeriodN, isBull, textY);
          if(tag != "")
          {
             color border = Darker(body, 0.20);
             string name = TPREF + tag + "_" + IntegerToString(k);
             datetime tMid = t1 + (t2 - t1)/2;
+
             if(!ObjectCreate(0, name, OBJ_TEXT, 0, tMid, textY))
             {
                ObjectDelete(name);
@@ -1055,41 +1061,31 @@ int OnCalculate(const int rates_total,
       }
    }
 
-   // Уровни открытия
-   double levels[]; string labels[]; datetime leftTimes[]; int n=0;
-   CollectUnvisitedOpenLevels(dd, ddCount, levels, labels, leftTimes, n);
-   color lineCol = Darker(BullBodyColor,0.20);
-   DrawLevels(levels, labels, leftTimes, n, lineCol, 1);
-
    // Недельные ATR-зоны
    if(ShowWeeklyATRZones)
    {
       CleanupATRObjects(WPRE, WeeksBack, PERIOD_W1);
-      
-      WeekData ww[]; int wCount=0;
+
+      WeekData ww[]; int wCount = 0;
       BuildWeeks(rates_total, time, open, high, low, close, ww, wCount);
+
       if(wCount > 0)
       {
-         newBarWeekly.IsNewBar();
          int toDrawW = MathMin(WeeksBack, wCount);
-         for(int shift=0; shift<toDrawW; ++shift)
+         for(int shift = 0; shift < toDrawW; ++shift)
          {
-          int pos = wCount - 1 - shift;
-
-            datetime periodStart = iTime(Symbol(), PERIOD_W1, shift);
-            if(periodStart <= 0)
-               periodStart = ww[pos].s;
+            int pos = wCount - 1 - shift;
+            datetime periodStart = ww[pos].s;
 
             string baseName = BuildWeeklyBaseName(periodStart);
-            if(baseName == "")
-               continue;
+            if(baseName == "") continue;
 
             bool createOnlyWhenMissing = (shift != 0);
             if(createOnlyWhenMissing && ObjectFind(0, baseName + "_UpRect") != -1)
                continue;
 
             UpdateWeeklyATRZones(ww[pos], pos, ww, wCount);
-            DrawWeeklyATRZones(ww[pos], baseName, WeeklyUpperBase, WeeklyLowerBase, createOnlyWhenMissing); 
+            DrawWeeklyATRZones(ww[pos], baseName, WeeklyUpperBase, WeeklyLowerBase, createOnlyWhenMissing);
          }
       }
    }
@@ -1097,25 +1093,21 @@ int OnCalculate(const int rates_total,
    // Месячные ATR-зоны
    if(ShowMonthlyATRZones)
    {
-       CleanupATRObjects(MPRE, MonthsBack, PERIOD_MN1);
-       
-      MonthData mm[]; int mmCount=0;
+      CleanupATRObjects(MPRE, MonthsBack, PERIOD_MN1);
+
+      MonthData mm[]; int mmCount = 0;
       BuildMonths(rates_total, time, open, high, low, close, mm, mmCount);
+
       if(mmCount > 0)
       {
-         newBarMonthly.IsNewBar();
          int toDrawM = MathMin(MonthsBack, mmCount);
-         for(int shift=0; shift<toDrawM; ++shift)
+         for(int shift = 0; shift < toDrawM; ++shift)
          {
-         int pos = mmCount - 1 - shift;
-
-            datetime periodStart = iTime(Symbol(), PERIOD_MN1, shift);
-            if(periodStart <= 0)
-               periodStart = mm[pos].s;
+            int pos = mmCount - 1 - shift;
+            datetime periodStart = mm[pos].s;
 
             string baseName = BuildMonthlyBaseName(periodStart);
-            if(baseName == "")
-               continue;
+            if(baseName == "") continue;
 
             bool createOnlyWhenMissing = (shift != 0);
             if(createOnlyWhenMissing && ObjectFind(0, baseName + "_UpRect") != -1)
@@ -1129,5 +1121,3 @@ int OnCalculate(const int rates_total,
 
    return(rates_total);
 }
-
-//+------------------------------------------------------------------+
