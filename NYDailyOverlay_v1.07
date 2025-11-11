@@ -1,0 +1,1133 @@
+//+------------------------------------------------------------------+
+//|                                         NYDailyOverlay_v1.07.mq4 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property strict
+#property indicator_chart_window
+#property version   "1.07"
+
+// ========================== INPUTS =================================
+input int   DaysBack = 60;                   // Сколько NY-дней рисовать (свечи)
+input color BullBodyColor = C'230,230,255';  // Цвет бычьего тела
+input color BearBodyColor = C'255,230,230';  // Цвет медвежьего тела
+input color WickColor     = clrDimGray;      // Цвет теней
+input int   WickWidth     = 1;               // Толщина теней и рамки
+
+// NY cut-off по серверному времени
+input bool  UseManualServerNYClose = true;
+input int   ManualServerNYCloseHour = 0;
+input int   ManualServerNYCloseMinute = 0;
+
+// Уровни открытия дня
+input int   LevelsMonthsBack = 12;           // Период поиска уровней (в месяцах)
+input int   LevelsUpCount    = 10;           // Сколько уровней выше текущей цены
+input int   LevelsDnCount    = 10;           // Сколько уровней ниже текущей цены
+
+// Классификация дневных свечей
+input int   ImpAtrPeriodN = 20;              // N для ATR_simple(N) (предыдущие N закрытых NY-дней)
+input bool  ShowLabels     = true;           // Рисовать метки типов дней
+input int   LabelFontSize  = 8;              // Размер шрифта меток
+
+// Недельные ATR-зоны
+input bool   ShowWeeklyATRZones = true;      // Рисовать недельные ATR-зоны
+input int    WeeksBack          = 12;        // Сколько недель рисовать (включая текущую)
+input int    WeeklyAtrPeriodN   = 20;        // N для ATR недели
+input double WeeklyBoxHeightPct = 0.10;      // Доля ATR для высоты зоны (0.10 = 10%)
+input color  WeeklyUpperBase    = C'200,200,255'; // База: фиолетовый (верхняя)
+input color  WeeklyLowerBase    = C'255,200,200'; // База: розовая (нижняя)
+
+// Месячные ATR-зоны
+input bool   ShowMonthlyATRZones = true;     // Рисовать месячные ATR-зоны
+input int    MonthsBack         = 12;        // Сколько месяцев рисовать (включая текущий)
+input int    MonthlyAtrPeriodN  = 12;        // N для ATR месяца
+input double MonthlyBoxHeightPct = 0.10;     // Доля ATR для высоты зоны (0.10 = 10%)
+input color  MonthlyUpperBase    = C'180,180,255'; // База: светло-фиолетовый (верхняя)
+input color  MonthlyLowerBase    = C'255,180,180'; // База: светло-розовая (нижняя)
+// ===================================================================
+
+string PREFIX = "NYDay_";   // префикс объектов свечей
+string LPREF  = "NYLvl_";   // префикс объектов уровней
+string TPREF  = "NYTag_";   // префикс меток типов
+string WPRE   = "WATR_";    // префикс недельных ATR-зон
+string MPRE   = "MATR_";    // префикс месячных ATR-зон
+
+// --- Класс для проверки новых баров ---
+class CIsNewBar {
+private:
+   string   m_symbol;
+   ENUM_TIMEFRAMES m_timeframe;
+   datetime m_lastBarTime;
+
+public:
+   CIsNewBar(string symbol, ENUM_TIMEFRAMES timeframe) {
+      m_symbol = symbol;
+      m_timeframe = timeframe;
+      m_lastBarTime = 0;
+   }
+
+   bool IsNewBar() {
+      datetime currentBarTime = iTime(m_symbol, m_timeframe, 0);
+      if(currentBarTime != m_lastBarTime) {
+         m_lastBarTime = currentBarTime;
+         return true;
+      }
+      return false;
+   }
+};
+
+// Глобальные объекты для проверки новых баров
+CIsNewBar *newBarWeekly;
+CIsNewBar *newBarMonthly;
+
+// --- Цветовые утилиты (MT4) ---------------------------------------
+int GetRValue(color c) { return (c & 0x0000FF); }
+int GetGValue(color c) { return ((c >> 8) & 0x0000FF); }
+int GetBValue(color c) { return ((c >> 16) & 0x0000FF); }
+color RGB(int r,int g,int b) { return (color)( (b << 16) | (g << 8) | r ); }
+
+color Darker(color c, double pct)
+{
+   if(pct < 0) pct = 0; if(pct > 1) pct = 1;
+   int r = (int)MathMax(0, GetRValue(c) * (1.0 - pct));
+   int g = (int)MathMax(0, GetGValue(c) * (1.0 - pct));
+   int b = (int)MathMax(0, GetBValue(c) * (1.0 - pct));
+   return (color)RGB(r,g,b);
+}
+
+// ========================= DAY GROUPING =============================
+int DayKeyForBar(datetime tBar)
+{
+   datetime adj = tBar - (ManualServerNYCloseHour*3600 + ManualServerNYCloseMinute*60);
+   MqlDateTime k; TimeToStruct(adj, k);
+   return (k.year*10000 + k.mon*100 + k.day);
+}
+
+void ServerDateForKey(int key, string &dateStr)
+{
+   int y = key / 10000;
+   int m = (key / 100) % 100;
+   int d = key % 100;
+   dateStr = IntegerToString(y) + "-"
+           + (m<10 ? "0" : "") + IntegerToString(m) + "-"
+           + (d<10 ? "0" : "") + IntegerToString(d);
+}
+
+datetime EndOfTodayServer()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   dt.hour=0; dt.min=0; dt.sec=0;
+   datetime today00 = StructToTime(dt);
+   return today00 + 24*3600;
+}
+
+// ======================= OBJECT MGMT ================================
+void ClearObjectsByPrefix(const string &pref)
+{
+   for(int i = ObjectsTotal()-1; i >= 0; --i)
+   {
+      string n = ObjectName(i);
+      if(StringFind(n, pref) == 0)
+         ObjectDelete(n);
+   }
+}
+
+string TwoDigits(int value)
+{
+if(value < 0) value = 0;
+   if(value < 10)
+      return "0" + IntegerToString(value);
+   return IntegerToString(value);
+}
+
+string BuildWeeklyBaseName(datetime periodStart)
+{
+   if(periodStart <= 0)
+      return "";
+   MqlDateTime dt; TimeToStruct(periodStart, dt);
+   string suffix = IntegerToString(dt.year) + TwoDigits(dt.mon) + TwoDigits(dt.day);
+   return WPRE + Symbol() + "_" + suffix;
+}
+
+string BuildMonthlyBaseName(datetime periodStart)
+{
+   if(periodStart <= 0)
+      return "";
+   MqlDateTime dt; TimeToStruct(periodStart, dt);
+   string suffix = IntegerToString(dt.year) + TwoDigits(dt.mon) + "01";
+   return MPRE + Symbol() + "_" + suffix;
+}
+
+void CreateOrUpdateRectangle(const string &name,
+                             datetime tLeft,
+                             double topPrice,
+                             datetime tRight,
+                             double bottomPrice,
+                             color col)
+{
+   if(ObjectFind(0, name) == -1)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, tLeft, topPrice, tRight, bottomPrice);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME, 0, tLeft);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, 0, topPrice);
+      ObjectSetInteger(0, name, OBJPROP_TIME, 1, tRight);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, 1, bottomPrice);
+   }
+   ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+}
+
+void CreateOrUpdateText(const string &name,
+                        datetime anchorTime,
+                        double anchorPrice,
+                        const string &text,
+                        color col)
+{
+   if(ObjectFind(0, name) == -1)
+   {
+      ObjectCreate(0, name, OBJ_TEXT, 0, anchorTime, anchorPrice);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME, 0, anchorTime);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, 0, anchorPrice);
+   }
+   ObjectSetText(name, text, 8, "Arial", col);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+}
+
+bool ExtractATRPeriodStart(const string &name, const string &prefix, datetime &periodStart)
+{
+   string prefSymbol = prefix + Symbol() + "_";
+   if(StringFind(name, prefSymbol) != 0)
+      return false;
+
+   int startIndex = StringLen(prefSymbol);
+   int nextUnd = StringFind(name, "_", startIndex);
+   string datePart;
+   if(nextUnd == -1)
+      datePart = StringSubstr(name, startIndex);
+   else
+      datePart = StringSubstr(name, startIndex, nextUnd - startIndex);
+
+   if(StringLen(datePart) < 8)
+      return false;
+
+   int year  = (int)StringToInteger(StringSubstr(datePart, 0, 4));
+   int month = (int)StringToInteger(StringSubstr(datePart, 4, 2));
+   int day   = (int)StringToInteger(StringSubstr(datePart, 6, 2));
+   if(year <= 0 || month <= 0 || day <= 0)
+      return false;
+
+   MqlDateTime dt;
+   dt.year = year;
+   dt.mon  = month;
+   dt.day  = day;
+   dt.hour = 0;
+   dt.min  = 0;
+   dt.sec  = 0;
+   periodStart = StructToTime(dt);
+   return (periodStart > 0);
+}
+
+void CleanupATRObjects(const string &prefix, int keepCount, ENUM_TIMEFRAMES timeframe)
+{
+   if(keepCount < 0)
+      keepCount = 0;
+
+   datetime threshold = 0;
+   if(keepCount > 0)
+      threshold = iTime(Symbol(), timeframe, keepCount - 1);
+
+   for(int i = ObjectsTotal() - 1; i >= 0; --i)
+   {
+      string name = ObjectName(i);
+      if(StringFind(name, prefix) != 0)
+         continue;
+
+      datetime periodStart;
+      if(!ExtractATRPeriodStart(name, prefix, periodStart))
+         continue;
+
+      if(keepCount == 0)
+      {
+         ObjectDelete(name);
+         continue;
+      }
+
+      if(threshold <= 0)
+         continue;
+
+      if(periodStart < threshold)
+         ObjectDelete(name);
+   }  
+}
+
+// ==================== DRAW: BODY + BORDER ==========================
+void DrawBodyAndBorder(string namePrefix, int idx,
+                       datetime t1, datetime t2,
+                       double bodyOpen, double bodyClose,
+                       color bodyColor)
+{
+   string rect = namePrefix + "Body_" + IntegerToString(idx);
+   ObjectCreate(0, rect, OBJ_RECTANGLE, 0, t1, bodyOpen, t2, bodyClose);
+   ObjectSetInteger(0, rect, OBJPROP_COLOR, bodyColor);
+   ObjectSetInteger(0, rect, OBJPROP_BACK, true);
+
+   color border = Darker(bodyColor, 0.20);
+
+   string top = namePrefix + "Top_" + IntegerToString(idx);
+   string bot = namePrefix + "Bot_" + IntegerToString(idx);
+   ObjectCreate(0, top, OBJ_TREND, 0, t1, bodyClose, t2, bodyClose);
+   ObjectCreate(0, bot, OBJ_TREND, 0, t1, bodyOpen, t2, bodyOpen);
+   ObjectSetInteger(0, top, OBJPROP_COLOR, border);
+   ObjectSetInteger(0, bot, OBJPROP_COLOR, border);
+   ObjectSetInteger(0, top, OBJPROP_WIDTH, WickWidth);
+   ObjectSetInteger(0, bot, OBJPROP_WIDTH, WickWidth);
+   ObjectSetInteger(0, top, OBJPROP_RAY, false);
+   ObjectSetInteger(0, bot, OBJPROP_RAY, false);
+   ObjectSetInteger(0, top, OBJPROP_BACK, true);
+   ObjectSetInteger(0, bot, OBJPROP_BACK, true);
+
+   string lef = namePrefix + "Left_" + IntegerToString(idx);
+   string rig = namePrefix + "Right_" + IntegerToString(idx);
+   ObjectCreate(0, lef, OBJ_TREND, 0, t1, bodyOpen, t1, bodyClose);
+   ObjectCreate(0, rig, OBJ_TREND, 0, t2, bodyOpen, t2, bodyClose);
+   ObjectSetInteger(0, lef, OBJPROP_COLOR, border);
+   ObjectSetInteger(0, rig, OBJPROP_COLOR, border);
+   ObjectSetInteger(0, lef, OBJPROP_WIDTH, WickWidth);
+   ObjectSetInteger(0, rig, OBJPROP_WIDTH, WickWidth);
+   ObjectSetInteger(0, lef, OBJPROP_RAY, false);
+   ObjectSetInteger(0, rig, OBJPROP_RAY, false);
+   ObjectSetInteger(0, lef, OBJPROP_BACK, true);
+   ObjectSetInteger(0, rig, OBJPROP_BACK, true);
+}
+
+// ======================= DRAW: WICKS ===============================
+void DrawWicks(string namePrefix, int idx,
+               datetime t1, datetime t2,
+               double openPrice, double closePrice,
+               double highPrice, double lowPrice,
+               color wickColor, int wickW)
+{
+   datetime tMid = t1 + (t2 - t1)/2;
+   double topBody = MathMax(openPrice, closePrice);
+   double botBody = MathMin(openPrice, closePrice);
+
+   if(highPrice > topBody)
+   {
+      string up = namePrefix + "WickUp_" + IntegerToString(idx);
+      ObjectCreate(0, up, OBJ_TREND, 0, tMid, topBody, tMid, highPrice);
+      ObjectSetInteger(0, up, OBJPROP_COLOR, wickColor);
+      ObjectSetInteger(0, up, OBJPROP_WIDTH, wickW);
+      ObjectSetInteger(0, up, OBJPROP_RAY, false);
+      ObjectSetInteger(0, up, OBJPROP_BACK, true);
+   }
+   if(lowPrice < botBody)
+   {
+      string dn = namePrefix + "WickDn_" + IntegerToString(idx);
+      ObjectCreate(0, dn, OBJ_TREND, 0, tMid, botBody, tMid, lowPrice);
+      ObjectSetInteger(0, dn, OBJPROP_COLOR, wickColor);
+      ObjectSetInteger(0, dn, OBJPROP_WIDTH, wickW);
+      ObjectSetInteger(0, dn, OBJPROP_RAY, false);
+      ObjectSetInteger(0, dn, OBJPROP_BACK, true);
+   }
+}
+
+// ======================= DATA STRUCTS ==============================
+struct DayData {
+   int key;                // YYYYMMDD по нашему cut-off
+   datetime s, e;          // начало/конец дня (по барам H1)
+   double o, c, h, l;      // Open, Close, High, Low дня
+};
+
+struct WeekData {
+   int key;                // YYYYMMDD понедельника
+   datetime s, e;          // начало/конец недели
+   double o, c, h, l;      // Open, Close, High, Low недели
+   bool isClosed;          // закрыта ли неделя
+   double atr;             // ATR для отрисовки зон
+   double initialOpen;     // Цена открытия для начальных зон
+   double upperZoneTop;    // Верхняя граница верхней зоны
+   double upperZoneBottom; // Нижняя граница верхней зоны
+   double lowerZoneTop;    // Верхняя граница нижней зоны
+   double lowerZoneBottom; // Нижняя граница нижней зоны
+};
+
+struct MonthData {
+   int key;                // YYYYMM по первому дню месяца
+   datetime s, e;          // начало/конец месяца
+   double o, c, h, l;      // Open, Close, High, Low месяца
+   bool isClosed;          // закрыт ли месяц
+   double atr;             // ATR для отрисовки зон
+   double initialOpen;     // Цена открытия для начальных зон
+   double upperZoneTop;    // Верхняя граница верхней зоны
+   double upperZoneBottom; // Нижняя граница верхней зоны
+   double lowerZoneTop;    // Верхняя граница нижней зоны
+   double lowerZoneBottom; // Нижняя граница нижней зоны
+};
+
+// ======================= CORE BUILD: DAYS ==========================
+void BuildFinishedDays(const int rates_total,
+                       const datetime &time[],
+                       const double &open[],
+                       const double &high[],
+                       const double &low[],
+                       const double &close[],
+                       DayData &dd[], int &outCount)
+{
+   ArrayResize(dd, 0);
+   int prevKey = -1;
+   bool dayInit = false;
+   datetime tStart=0, tEnd=0;
+   double dOpen=0, dClose=0, dHigh=0, dLow=0;
+
+   int barsNeed = MathMin(rates_total - 1, (DaysBack + 3) * 30);
+
+   for(int i = barsNeed; i >= 0; --i)
+   {
+      int key = DayKeyForBar(time[i]);
+      if(key != prevKey)
+      {
+         if(dayInit)
+         {
+            DayData d;
+            d.key = DayKeyForBar(tStart);
+            d.s = tStart; d.e = tEnd; d.o = dOpen; d.c = dClose; d.h = dHigh; d.l = dLow;
+            int n = ArraySize(dd); ArrayResize(dd, n+1); dd[n] = d;
+         }
+         prevKey = key;
+         dayInit = true;
+         tStart = time[i];
+         tEnd = time[i] + 3600;
+         dOpen = open[i];
+         dClose = close[i];
+         dHigh = high[i];
+         dLow = low[i];
+      }
+      else
+      {
+         if(high[i] > dHigh) dHigh = high[i];
+         if(low[i] < dLow) dLow = low[i];
+         dClose = close[i];
+         tEnd = time[i] + 3600;
+      }
+   }
+   outCount = ArraySize(dd);
+}
+
+// ======================= LEVELS LOGIC =============================
+bool IsLevelClosedInFuture(double level, int startIndex, DayData &dd[], int total)
+{
+   for(int j = startIndex + 1; j < total; ++j)
+      if(dd[j].h >= level && dd[j].l <= level) return true;
+   return false;
+}
+
+bool ExistsLevel(double level, double &levels[], int count)
+{
+   for(int i=0; i<count; ++i)
+      if(NormalizeDouble(levels[i], Digits) == NormalizeDouble(level, Digits))
+         return true;
+   return false;
+}
+
+void CollectUnvisitedOpenLevels(DayData &dd[], int total,
+                                double &outLevels[], string &outLabels[],
+                                datetime &outLeft[], int &outN)
+{
+   ArrayResize(outLevels, 0);
+   ArrayResize(outLabels, 0);
+   ArrayResize(outLeft, 0);
+   outN = 0;
+   if(total <= 0) return;
+
+   datetime now = TimeCurrent();
+   datetime cutoff = now - (datetime)(LevelsMonthsBack * 30 * 86400);
+
+   for(int i = 0; i < total; ++i)
+   {
+      if(dd[i].s < cutoff) continue;
+
+      double level = dd[i].o;
+      bool closed = IsLevelClosedInFuture(level, i, dd, total);
+      if(closed) continue;
+      if(ExistsLevel(level, outLevels, outN)) continue;
+
+      int n = outN;
+      ArrayResize(outLevels, n+1);
+      ArrayResize(outLabels, n+1);
+      ArrayResize(outLeft, n+1);
+
+      outLevels[n] = level;
+      outLeft[n] = dd[i].s;
+
+      string dateStr; ServerDateForKey(dd[i].key, dateStr);
+      string priceStr = DoubleToString(NormalizeDouble(level, Digits), Digits);
+      outLabels[n] = dateStr + "  " + priceStr;
+
+      outN++;
+   }
+}
+
+void SortByDistance(double &arr[], int &idxs[], int len, double mid)
+{
+   for(int a=1; a<len; ++a)
+   {
+      int j=a; int v=idxs[a];
+      while(j>0 && MathAbs(arr[idxs[j-1]]-mid) > MathAbs(arr[v]-mid))
+      { idxs[j]=idxs[j-1]; j--; }
+      idxs[j]=v;
+   }
+}
+
+void DrawLevels(double &levels[], string &labels[], datetime &leftTimes[], int n,
+                color lineColor, int width)
+{
+   if(n <= 0) return;
+
+   double mid = Bid;
+
+   int idxBelow[]; ArrayResize(idxBelow, 0);
+   int idxAbove[]; ArrayResize(idxAbove, 0);
+
+   for(int i=0;i<n;++i)
+   {
+      double lv = levels[i];
+      if(lv < mid) { int k=ArraySize(idxBelow); ArrayResize(idxBelow,k+1); idxBelow[k]=i; }
+      else if(lv > mid) { int k=ArraySize(idxAbove); ArrayResize(idxAbove,k+1); idxAbove[k]=i; }
+      else { int k=ArraySize(idxAbove); ArrayResize(idxAbove,k+1); idxAbove[k]=i; }
+   }
+
+   SortByDistance(levels, idxBelow, ArraySize(idxBelow), mid);
+   SortByDistance(levels, idxAbove, ArraySize(idxAbove), mid);
+
+   int takeBelow = MathMin(LevelsDnCount, ArraySize(idxBelow));
+   int takeAbove = MathMin(LevelsUpCount, ArraySize(idxAbove));
+
+   datetime tRight = EndOfTodayServer();
+
+   for(int i=0;i<takeBelow;++i)
+   {
+      int ix = idxBelow[i];
+      double lv = levels[ix];
+      datetime tLeft = leftTimes[ix];
+      string base = LPREF + "Dn_" + IntegerToString(i);
+
+      ObjectCreate(0, base, OBJ_TREND, 0, tLeft, lv, tRight, lv);
+      ObjectSetInteger(0, base, OBJPROP_COLOR, lineColor);
+      ObjectSetInteger(0, base, OBJPROP_WIDTH, width);
+      ObjectSetInteger(0, base, OBJPROP_RAY, false);
+      ObjectSetInteger(0, base, OBJPROP_BACK, true);
+
+      string txt = base + "_txt";
+      ObjectCreate(0, txt, OBJ_TEXT, 0, tRight, lv);
+      ObjectSetText(txt, labels[ix], 8, "Arial", lineColor);
+      ObjectSetInteger(0, txt, OBJPROP_BACK, true);
+   }
+
+   for(int i=0;i<takeAbove;++i)
+   {
+      int ix = idxAbove[i];
+      double lv = levels[ix];
+      datetime tLeft = leftTimes[ix];
+      string base = LPREF + "Up_" + IntegerToString(i);
+
+      ObjectCreate(0, base, OBJ_TREND, 0, tLeft, lv, tRight, lv);
+      ObjectSetInteger(0, base, OBJPROP_COLOR, lineColor);
+      ObjectSetInteger(0, base, OBJPROP_WIDTH, width);
+      ObjectSetInteger(0, base, OBJPROP_RAY, false);
+      ObjectSetInteger(0, base, OBJPROP_BACK, true);
+
+      string txt = base + "_txt";
+      ObjectCreate(0, txt, OBJ_TEXT, 0, tRight, lv);
+      ObjectSetText(txt, labels[ix], 8, "Arial", lineColor);
+      ObjectSetInteger(0, txt, OBJPROP_BACK, true);
+   }
+}
+
+// ======================= CLASSIFICATION ============================
+double ATR_Simple_N(int idxDay, DayData &dd[], int total, int N)
+{
+   int available = idxDay;
+   int take = MathMin(N, available);
+   if(take <= 0) return 0.0;
+
+   double sum=0.0;
+   for(int k=1; k<=take; ++k)
+   {
+      int j = idxDay - k;
+      sum += (dd[j].h - dd[j].l);
+   }
+   return sum / take;
+}
+
+bool InLowerThird(double price, double lo, double hi)
+{
+   double D = hi - lo; if(D <= 0) return false;
+   double t1 = lo + D/3.0;
+   return (price >= lo && price <= t1);
+}
+
+bool InUpperThird(double price, double lo, double hi)
+{
+   double D = hi - lo; if(D <= 0) return false;
+   double t2 = lo + 2.0*D/3.0;
+   return (price >= t2 && price <= hi);
+}
+
+string ClassifyDayAndLabel(int idxDay, DayData &dd[], int total, int N,
+                           bool &isBull, double &textY)
+{
+   string tag = "";
+   double o = dd[idxDay].o, c = dd[idxDay].c, h = dd[idxDay].h, l = dd[idxDay].l;
+   isBull = (c >= o);
+   double range = h - l;
+   double body = MathAbs(c - o);
+   if(range <= 0) { tag="FLT"; textY = l; return tag; }
+
+   bool oLow = InLowerThird(o,l,h);
+   bool cLow = InLowerThird(c,l,h);
+   bool oUp = InUpperThird(o,l,h);
+   bool cUp = InUpperThird(c,l,h);
+
+   bool impulseShapeBull = (oLow && cUp);
+   bool impulseShapeBear = (oUp && cLow);
+   bool impulseShape = (impulseShapeBull || impulseShapeBear);
+
+   double atrN = ATR_Simple_N(idxDay, dd, total, N);
+
+   if(impulseShape && atrN > 0.0)
+   {
+      if(range > atrN) tag = "IMP";
+      else tag = "IMP-";
+      if(impulseShapeBull) { isBull = true; textY = l - (range*0.02); }
+      else { isBull = false; textY = h + (range*0.09); }
+      return tag;
+   }
+
+   if(body > 0)
+   {
+      bool endInExtreme = (oLow || oUp || cLow || cUp);
+      double topBody = MathMax(o,c);
+      double botBody = MathMin(o,c);
+      bool upperWickLonger = (h - topBody) > body;
+      bool lowerWickLonger = (botBody - l) > body;
+      bool isFlatShape = (upperWickLonger && lowerWickLonger);
+
+      if(endInExtreme && !isFlatShape)
+      {
+         tag = "CP";
+         if(isBull) textY = l - (range * 0.02);
+         else textY = h + (range * 0.09);
+         return tag;
+      }
+   }
+
+   double topBody = MathMax(o,c);
+   double botBody = MathMin(o,c);
+   bool upperWickLonger = (h - topBody) > body;
+   bool lowerWickLonger = (botBody - l) > body;
+   if(upperWickLonger && lowerWickLonger)
+   {
+      tag = "FLT";
+      if(body==0 || isBull) textY = l - (range*0.02);
+      else textY = h + (range*0.09);
+      return tag;
+   }
+
+   return "";
+}
+
+void DrawDayLabel(const string &namePrefix, int idx,
+                  datetime t1, datetime t2,
+                  const string &text, color col, int fontSize, bool upperPos)
+{
+   if(text=="") return;
+   datetime tMid = t1 + (t2 - t1)/2;
+   string obj = namePrefix + "Txt_" + IntegerToString(idx);
+   if(!ObjectCreate(0, obj, OBJ_TEXT, 0, tMid, 0))
+   {
+      ObjectDelete(obj);
+      ObjectCreate(0, obj, OBJ_TEXT, 0, tMid, 0);
+   }
+   ObjectSetText(obj, text, fontSize, "Arial", col);
+   ObjectSetInteger(0, obj, OBJPROP_BACK, true);
+}
+
+// ======================= WEEK GROUPING =============================
+int WeekKeyForBar(datetime tBar)
+{
+   MqlDateTime s; TimeToStruct(tBar, s);
+   s.hour=0; s.min=0; s.sec=0; datetime d0 = StructToTime(s);
+   int dow = s.day_of_week;
+   int daysBackToMon = (dow==0 ? 6 : (dow-1));
+   datetime monday = d0 - (daysBackToMon * 86400);
+   MqlDateTime m; TimeToStruct(monday, m);
+   return (m.year*100 + m.mon)*100 + m.day;
+}
+
+void BuildWeeks(const int rates_total,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                WeekData &ww[], int &outCount)
+{
+   ArrayResize(ww, 0);
+   int prevKey = -1;
+   bool wInit=false;
+   datetime wStart=0, wEnd=0;
+   double wOpen=0,wClose=0,wHigh=0,wLow=0;
+
+   for(int i=rates_total-1; i>=0; --i)
+   {
+      int key = WeekKeyForBar(time[i]);
+      if(key != prevKey)
+      {
+         if(wInit)
+         {
+            WeekData w;
+            w.key = WeekKeyForBar(wStart);
+            w.s = wStart; w.e = wEnd;
+            w.o = wOpen; w.c = wClose; w.h = wHigh; w.l = wLow;
+            w.isClosed = true;
+            w.atr = 0.0;
+            w.initialOpen = wOpen;
+            w.upperZoneTop = 0.0;
+            w.upperZoneBottom = 0.0;
+            w.lowerZoneTop = 0.0;
+            w.lowerZoneBottom = 0.0;
+            int n=ArraySize(ww); ArrayResize(ww,n+1); ww[n]=w;
+         }
+         prevKey = key;
+         wInit = true;
+         wStart = time[i];
+         wEnd = time[i] + 3600;
+         wOpen = open[i];
+         wClose = close[i];
+         wHigh = high[i];
+         wLow = low[i];
+      }
+      else
+      {
+         if(high[i] > wHigh) wHigh = high[i];
+         if(low[i] < wLow) wLow = low[i];
+         wClose = close[i];
+         wEnd = time[i] + 3600;
+      }
+   }
+
+   if(wInit)
+   {
+      WeekData w;
+      w.key = WeekKeyForBar(wStart);
+      w.s = wStart; w.e = wEnd;
+      w.o = wOpen; w.c = wClose; w.h = wHigh; w.l = wLow;
+      w.isClosed = false;
+      w.atr = 0.0;
+      w.initialOpen = wOpen;
+      w.upperZoneTop = 0.0;
+      w.upperZoneBottom = 0.0;
+      w.lowerZoneTop = 0.0;
+      w.lowerZoneBottom = 0.0;
+      int n=ArraySize(ww); ArrayResize(ww,n+1); ww[n]=w;
+   }
+   outCount = ArraySize(ww);
+}
+
+datetime EndOfBrokerWeek(datetime anyInWeek)
+{
+   MqlDateTime s; TimeToStruct(anyInWeek, s);
+   s.hour=0; s.min=0; s.sec=0;
+   datetime d0 = StructToTime(s);
+   int dow = s.day_of_week;
+   int daysToSat = (6 - dow);
+   return d0 + (daysToSat+1)*86400;
+}
+
+// ======================= MONTH GROUPING ============================
+int MonthKeyForBar(datetime tBar)
+{
+   MqlDateTime s; TimeToStruct(tBar, s);
+   s.day=1; s.hour=0; s.min=0; s.sec=0;
+   datetime d0 = StructToTime(s);
+   MqlDateTime m; TimeToStruct(d0, m);
+   return m.year*100 + m.mon;
+}
+
+void BuildMonths(const int rates_total,
+                 const datetime &time[],
+                 const double &open[],
+                 const double &high[],
+                 const double &low[],
+                 const double &close[],
+                 MonthData &mm[], int &outCount)
+{
+   ArrayResize(mm, 0);
+   int prevKey = -1;
+   bool mInit=false;
+   datetime mStart=0, mEnd=0;
+   double mOpen=0,mClose=0,mHigh=0,mLow=0;
+
+   for(int i=rates_total-1; i>=0; --i)
+   {
+      int key = MonthKeyForBar(time[i]);
+      if(key != prevKey)
+      {
+         if(mInit)
+         {
+            MonthData m;
+            m.key = MonthKeyForBar(mStart);
+            m.s = mStart; m.e = mEnd;
+            m.o = mOpen; m.c = mClose; m.h = mHigh; m.l = mLow;
+            m.isClosed = true;
+            m.atr = 0.0;
+            m.initialOpen = mOpen;
+            m.upperZoneTop = 0.0;
+            m.upperZoneBottom = 0.0;
+            m.lowerZoneTop = 0.0;
+            m.lowerZoneBottom = 0.0;
+            int n=ArraySize(mm); ArrayResize(mm,n+1); mm[n]=m;
+         }
+         prevKey = key;
+         mInit = true;
+         mStart = time[i];
+         mEnd = time[i] + 3600;
+         mOpen = open[i];
+         mClose = close[i];
+         mHigh = high[i];
+         mLow = low[i];
+      }
+      else
+      {
+         if(high[i] > mHigh) mHigh = high[i];
+         if(low[i] < mLow) mLow = low[i];
+         mClose = close[i];
+         mEnd = time[i] + 3600;
+      }
+   }
+
+   if(mInit)
+   {
+      MonthData m;
+      m.key = MonthKeyForBar(mStart);
+      m.s = mStart; m.e = mEnd;
+      m.o = mOpen; m.c = mClose; m.h = mHigh; m.l = mLow;
+      m.isClosed = false;
+      m.atr = 0.0;
+      m.initialOpen = mOpen;
+      m.upperZoneTop = 0.0;
+      m.upperZoneBottom = 0.0;
+      m.lowerZoneTop = 0.0;
+      m.lowerZoneBottom = 0.0;
+      int n=ArraySize(mm); ArrayResize(mm,n+1); mm[n]=m;
+   }
+   outCount = ArraySize(mm);
+}
+
+datetime EndOfMonth(datetime anyInMonth)
+{
+   MqlDateTime s; TimeToStruct(anyInMonth, s);
+   s.day=1; s.hour=0; s.min=0; s.sec=0;
+   datetime d0 = StructToTime(s);
+   s.mon += 1; if(s.mon > 12) { s.mon = 1; s.year += 1; }
+   return StructToTime(s);
+}
+
+// ATR для недель и месяцев
+double ATR_Weekly_Simple_N(int idxWeek, WeekData &ww[], int total, int N)
+{
+   int count=0; double sum=0.0;
+   for(int k=idxWeek-1; k>=0 && count<N; --k)
+   {
+      if(!ww[k].isClosed) continue;
+      sum += (ww[k].h - ww[k].l);
+      count++;
+   }
+   if(count<=0) return 0.0;
+   return sum / count;
+}
+
+double ATR_Monthly_Simple_N(int idxMonth, MonthData &mm[], int total, int N)
+{
+   int count=0; double sum=0.0;
+   for(int k=idxMonth-1; k>=0 && count<N; --k)
+   {
+      if(!mm[k].isClosed) continue;
+      sum += (mm[k].h - mm[k].l);
+      count++;
+   }
+   if(count<=0) return 0.0;
+   return sum / count;
+}
+
+// Обновление зон для недели
+void UpdateWeeklyATRZones(WeekData &w, int idxWeek, WeekData &ww[], int total)
+{
+   // ATR по закрытым неделям
+   w.atr = ATR_Weekly_Simple_N(idxWeek, ww, total, WeeklyAtrPeriodN);
+   if(w.atr <= 0.0) return;
+
+   const double boxHeight = w.atr * WeeklyBoxHeightPct;
+
+   // Верхняя зона "от текущего LOW"
+   w.upperZoneTop    = w.l + w.atr;
+   w.upperZoneBottom = w.upperZoneTop - boxHeight;
+
+   // Нижняя зона "от текущего HIGH"
+   w.lowerZoneBottom = w.h - w.atr;
+   w.lowerZoneTop    = w.lowerZoneBottom + boxHeight;
+}
+
+
+// Обновление зон для месяца
+void UpdateMonthlyATRZones(MonthData &m, int idxMonth, MonthData &mm[], int total)
+{
+   m.atr = ATR_Monthly_Simple_N(idxMonth, mm, total, MonthlyAtrPeriodN);
+   if(m.atr <= 0.0) return;
+
+   const double boxHeight = m.atr * MonthlyBoxHeightPct;
+
+   // Верхняя от текущего LOW месяца
+   m.upperZoneTop    = m.l + m.atr;
+   m.upperZoneBottom = m.upperZoneTop - boxHeight;
+
+   // Нижняя от текущего HIGH месяца
+   m.lowerZoneBottom = m.h - m.atr;
+   m.lowerZoneTop    = m.lowerZoneBottom + boxHeight;
+}
+
+
+// Отрисовка ATR-зон
+void DrawWeeklyATRZones(WeekData &w, const string &baseName, color colUpperBase, color colLowerBase, bool createOnlyWhenMissing)
+{
+   if(baseName == "") return;
+   if(w.atr <= 0.0) return;
+   double boxHeight = w.atr * WeeklyBoxHeightPct;
+   if(boxHeight <= 0.0) return;
+
+   string upName = baseName + "_UpRect";
+   if(createOnlyWhenMissing && ObjectFind(0, upName) != -1)
+      return;
+
+   datetime tLeft  = w.s;
+   datetime tRight = w.isClosed ? w.e : EndOfBrokerWeek(w.s);
+
+   string dnName = baseName + "_DnRect";
+   
+   CreateOrUpdateRectangle(upName, tLeft, w.upperZoneTop, tRight, w.upperZoneBottom, colUpperBase);
+   CreateOrUpdateRectangle(dnName, tLeft, w.lowerZoneTop, tRight, w.lowerZoneBottom, colLowerBase);   
+
+   double upMid = 0.5 * (w.upperZoneTop + w.upperZoneBottom);
+   double dnMid = 0.5 * (w.lowerZoneTop + w.lowerZoneBottom);
+   
+   int atrPts = (int)MathRound(w.atr / _Point);
+   string wAtrStr = "W_ATR: " + IntegerToString(atrPts);
+   string upTxt = baseName + "_UpTxt";
+   string dnTxt = baseName + "_DnTxt";
+
+   CreateOrUpdateText(upTxt, tLeft, upMid, wAtrStr, Darker(colUpperBase, 0.50));
+   CreateOrUpdateText(dnTxt, tLeft, dnMid, wAtrStr, Darker(colLowerBase, 0.50));
+}   
+   if(!ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid))
+   { ObjectDelete(dnTxt); ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid); }
+   ObjectSetText(dnTxt, wAtrStr, 8, "Arial", Darker(colLowerBase, 0.50));
+   ObjectSetInteger(0, dnTxt, OBJPROP_BACK, true);
+}
+void DrawMonthlyATRZones(MonthData &m, int visualIndex, color colUpperBase, color colLowerBase)
+{
+   if(m.atr <= 0.0) return;
+   double boxHeight = m.atr * MonthlyBoxHeightPct;
+   if(boxHeight <= 0.0) return;
+
+   datetime tLeft  = m.s;
+   datetime tRight = m.isClosed ? m.e : EndOfMonth(m.s);
+
+   // Прямоугольники (заливка)
+   string upName = MPRE + "Up_" + IntegerToString(visualIndex);
+   string dnName = MPRE + "Dn_" + IntegerToString(visualIndex);
+
+   ObjectCreate(0, upName, OBJ_RECTANGLE, 0, tLeft, m.upperZoneTop, tRight, m.upperZoneBottom);
+   ObjectSetInteger(0, upName, OBJPROP_COLOR, colUpperBase);
+   ObjectSetInteger(0, upName, OBJPROP_BACK, true);
+
+   ObjectCreate(0, dnName, OBJ_RECTANGLE, 0, tLeft, m.lowerZoneTop, tRight, m.lowerZoneBottom);
+   ObjectSetInteger(0, dnName, OBJPROP_COLOR, colLowerBase);
+   ObjectSetInteger(0, dnName, OBJPROP_BACK, true);
+
+   // Подписи Month_ATR на левом краю коробок
+   string upTxt = MPRE + "UpTxt_" + IntegerToString(visualIndex);
+   string dnTxt = MPRE + "DnTxt_" + IntegerToString(visualIndex);
+
+   double upMid = 0.5 * (m.upperZoneTop + m.upperZoneBottom);
+   double dnMid = 0.5 * (m.lowerZoneTop + m.lowerZoneBottom);
+
+   string mAtrStr = "Month_ATR: " + DoubleToString(NormalizeDouble(m.atr, Digits), Digits);
+
+   if(!ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid))
+   { ObjectDelete(upTxt); ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid); }
+   ObjectSetText(upTxt, mAtrStr, 8, "Arial", Darker(colUpperBase, 0.50));
+   ObjectSetInteger(0, upTxt, OBJPROP_BACK, true);
+
+   if(!ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid))
+   { ObjectDelete(dnTxt); ObjectCreate(0, dnTxt, OBJ_TEXT, 0, tLeft, dnMid); }
+   ObjectSetText(dnTxt, mAtrStr, 8, "Arial", Darker(colLowerBase, 0.50));
+   ObjectSetInteger(0, dnTxt, OBJPROP_BACK, true);
+}
+
+
+// ======================= LIFECYCLE =================================
+int OnInit()
+{
+   newBarWeekly = new CIsNewBar(Symbol(), PERIOD_W1);
+   newBarMonthly = new CIsNewBar(Symbol(), PERIOD_MN1);
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   ClearObjectsByPrefix(PREFIX);
+   ClearObjectsByPrefix(LPREF);
+   ClearObjectsByPrefix(TPREF);
+   ClearObjectsByPrefix(WPRE);
+   ClearObjectsByPrefix(MPRE);
+   delete newBarWeekly;
+   delete newBarMonthly;
+}
+
+// ======================= MAIN CALC =================================
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   if(Period() != PERIOD_H1) return(rates_total);
+
+   // Очистка только объектов свечей, уровней и меток
+   ClearObjectsByPrefix(PREFIX);
+   ClearObjectsByPrefix(LPREF);
+   ClearObjectsByPrefix(TPREF);
+
+   // Собираем дни
+   DayData dd[]; int ddCount=0;
+   BuildFinishedDays(rates_total, time, open, high, low, close, dd, ddCount);
+   if(ddCount <= 0) return(rates_total);
+
+   // Рисуем NY-свечи
+   int toDraw = MathMin(DaysBack, ddCount);
+   for(int k = 0; k < toDraw; ++k)
+   {
+      int pos = ddCount - 1 - k;
+      double o = dd[pos].o, c = dd[pos].c, h = dd[pos].h, l = dd[pos].l;
+      datetime t1 = dd[pos].s, t2 = dd[pos].e;
+      color body = (c >= o) ? BullBodyColor : BearBodyColor;
+      DrawBodyAndBorder(PREFIX, k, t1, t2, o, c, body);
+      DrawWicks(PREFIX, k, t1, t2, o, c, h, l, WickColor, WickWidth);
+
+      if(ShowLabels)
+      {
+         bool isBull=false; double textY=0.0;
+         string tag = ClassifyDayAndLabel(pos, dd, ddCount, ImpAtrPeriodN, isBull, textY);
+         if(tag != "")
+         {
+            color border = Darker(body, 0.20);
+            string name = TPREF + tag + "_" + IntegerToString(k);
+            datetime tMid = t1 + (t2 - t1)/2;
+            if(!ObjectCreate(0, name, OBJ_TEXT, 0, tMid, textY))
+            {
+               ObjectDelete(name);
+               ObjectCreate(0, name, OBJ_TEXT, 0, tMid, textY);
+            }
+            ObjectSetText(name, tag, LabelFontSize, "Arial", border);
+            ObjectSetInteger(0, name, OBJPROP_BACK, true);
+         }
+      }
+   }
+
+   // Уровни открытия
+   double levels[]; string labels[]; datetime leftTimes[]; int n=0;
+   CollectUnvisitedOpenLevels(dd, ddCount, levels, labels, leftTimes, n);
+   color lineCol = Darker(BullBodyColor,0.20);
+   DrawLevels(levels, labels, leftTimes, n, lineCol, 1);
+
+   // Недельные ATR-зоны
+   if(ShowWeeklyATRZones)
+   {
+      CleanupATRObjects(WPRE, WeeksBack, PERIOD_W1);
+      
+      WeekData ww[]; int wCount=0;
+      BuildWeeks(rates_total, time, open, high, low, close, ww, wCount);
+      if(wCount > 0)
+      {
+         newBarWeekly.IsNewBar();
+         int toDrawW = MathMin(WeeksBack, wCount);
+         for(int shift=0; shift<toDrawW; ++shift)
+         {
+          int pos = wCount - 1 - shift;
+
+            datetime periodStart = iTime(Symbol(), PERIOD_W1, shift);
+            if(periodStart <= 0)
+               periodStart = ww[pos].s;
+
+            string baseName = BuildWeeklyBaseName(periodStart);
+            if(baseName == "")
+               continue;
+
+            bool createOnlyWhenMissing = (shift != 0);
+            if(createOnlyWhenMissing && ObjectFind(0, baseName + "_UpRect") != -1)
+               continue;
+
+            UpdateWeeklyATRZones(ww[pos], pos, ww, wCount);
+            DrawWeeklyATRZones(ww[pos], baseName, WeeklyUpperBase, WeeklyLowerBase, createOnlyWhenMissing); 
+         }
+      }
+   }
+
+   // Месячные ATR-зоны
+   if(ShowMonthlyATRZones)
+   {
+       CleanupATRObjects(MPRE, MonthsBack, PERIOD_MN1);
+       
+      MonthData mm[]; int mmCount=0;
+      BuildMonths(rates_total, time, open, high, low, close, mm, mmCount);
+      if(mmCount > 0)
+      {
+         newBarMonthly.IsNewBar();
+         int toDrawM = MathMin(MonthsBack, mmCount);
+         for(int shift=0; shift<toDrawM; ++shift)
+         {
+         int pos = mmCount - 1 - shift;
+
+            datetime periodStart = iTime(Symbol(), PERIOD_MN1, shift);
+            if(periodStart <= 0)
+               periodStart = mm[pos].s;
+
+            string baseName = BuildMonthlyBaseName(periodStart);
+            if(baseName == "")
+               continue;
+
+            bool createOnlyWhenMissing = (shift != 0);
+            if(createOnlyWhenMissing && ObjectFind(0, baseName + "_UpRect") != -1)
+               continue;
+
+            UpdateMonthlyATRZones(mm[pos], pos, mm, mmCount);
+            DrawMonthlyATRZones(mm[pos], baseName, MonthlyUpperBase, MonthlyLowerBase, createOnlyWhenMissing);
+         }
+      }
+   }
+
+   return(rates_total);
+}
+
+//+------------------------------------------------------------------+
