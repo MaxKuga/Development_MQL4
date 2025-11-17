@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property strict
 #property indicator_chart_window
-#property version   "1.17"
+#property version   "1.06"
 
 // ========================== INPUTS =================================
 input int   DaysBack = 60;                   // Сколько NY-дней рисовать (свечи)
@@ -806,7 +806,7 @@ void DrawWeeklyATRZones(WeekData &w, int visualIndex, color colUpperBase, color 
    double upMid = 0.5 * (w.upperZoneTop + w.upperZoneBottom);
    double dnMid = 0.5 * (w.lowerZoneTop + w.lowerZoneBottom);
 
-   string wAtrStr = "W_ATR: " + DoubleToString(NormalizeDouble(w.atr, Digits), Digits);
+   string wAtrStr = "W_ATR: " + IntegerToString((int)(w.atr * 100000));
 
    if(!ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid))
    { ObjectDelete(upTxt); ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid); }
@@ -846,7 +846,7 @@ void DrawMonthlyATRZones(MonthData &m, int visualIndex, color colUpperBase, colo
    double upMid = 0.5 * (m.upperZoneTop + m.upperZoneBottom);
    double dnMid = 0.5 * (m.lowerZoneTop + m.lowerZoneBottom);
 
-   string mAtrStr = "Month_ATR: " + DoubleToString(NormalizeDouble(m.atr, Digits), Digits);
+   string mAtrStr = "Month_ATR: " + IntegerToString((int)(m.atr * 100000));
 
    if(!ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid))
    { ObjectDelete(upTxt); ObjectCreate(0, upTxt, OBJ_TEXT, 0, tLeft, upMid); }
@@ -940,7 +940,7 @@ int OnCalculate(const int rates_total,
    color lineCol = Darker(BullBodyColor,0.20);
    DrawLevels(levels, labels, leftTimes, n, lineCol, 1);
 
-   // Недельные ATR-зоны
+        // Недельные ATR-зоны
    if(ShowWeeklyATRZones)
    {
       WeekData ww[]; int wCount=0;
@@ -949,27 +949,28 @@ int OnCalculate(const int rates_total,
       {
          bool newWeek = newBarWeekly.IsNewBar();
          int toDrawW = MathMin(WeeksBack, wCount);
+
          for(int k=0; k<toDrawW; ++k)
          {
             int pos = wCount - 1 - k;
-            // Очистка только текущей зоны перед обновлением
-            ClearCurrentATRZoneObjects(WPRE, k);
-            // Обновление зон: для текущей недели — на каждом H1, для завершенных — при новом W1
-            if(!ww[pos].isClosed || prev_calculated == 0)
-            {
-               UpdateWeeklyATRZones(ww[pos], pos, ww, wCount);
-               DrawWeeklyATRZones(ww[pos], k, WeeklyUpperBase, WeeklyLowerBase);
-            }
-            else if(newWeek)
-            {
-               UpdateWeeklyATRZones(ww[pos], pos, ww, wCount);
-               DrawWeeklyATRZones(ww[pos], k, WeeklyUpperBase, WeeklyLowerBase);
-            }
+
+            bool isCurrentWeek    = !ww[pos].isClosed;
+            bool needRedrawClosed = (prev_calculated == 0 || newWeek);
+            bool needRedraw       = (isCurrentWeek || needRedrawClosed);
+            if(!needRedraw)
+               continue;
+
+            // Чистим только текущую (незакрытую) неделю
+            if(isCurrentWeek)
+               ClearCurrentATRZoneObjects(WPRE, k);
+
+            UpdateWeeklyATRZones(ww[pos], pos, ww, wCount);
+            DrawWeeklyATRZones(ww[pos], k, WeeklyUpperBase, WeeklyLowerBase);
          }
       }
    }
 
-   // Месячные ATR-зоны
+         // Месячные ATR-зоны
    if(ShowMonthlyATRZones)
    {
       MonthData mm[]; int mmCount=0;
@@ -978,27 +979,27 @@ int OnCalculate(const int rates_total,
       {
          bool newMonth = newBarMonthly.IsNewBar();
          int toDrawM = MathMin(MonthsBack, mmCount);
+
          for(int k=0; k<toDrawM; ++k)
          {
             int pos = mmCount - 1 - k;
-            // Очистка только текущей зоны перед обновлением
-            ClearCurrentATRZoneObjects(MPRE, k);
-            // Обновление зон: для текущего месяца — на каждом H1, для завершенных — при новом MN1
-            if(!mm[pos].isClosed || prev_calculated == 0)
-            {
-               UpdateMonthlyATRZones(mm[pos], pos, mm, mmCount);
-               DrawMonthlyATRZones(mm[pos], k, MonthlyUpperBase, MonthlyLowerBase);
-            }
-            else if(newMonth)
-            {
-               UpdateMonthlyATRZones(mm[pos], pos, mm, mmCount);
-               DrawMonthlyATRZones(mm[pos], k, MonthlyUpperBase, MonthlyLowerBase);
-            }
+
+            bool isCurrentMonth   = !mm[pos].isClosed;
+            bool needRedrawClosed = (prev_calculated == 0 || newMonth);
+            bool needRedraw       = (isCurrentMonth || needRedrawClosed);
+            if(!needRedraw)
+               continue;
+
+            // Чистим только текущий (незакрытый) месяц
+            if(isCurrentMonth)
+               ClearCurrentATRZoneObjects(MPRE, k);
+
+            UpdateMonthlyATRZones(mm[pos], pos, mm, mmCount);
+            DrawMonthlyATRZones(mm[pos], k, MonthlyUpperBase, MonthlyLowerBase);
          }
       }
    }
 
    return(rates_total);
 }
-
 //+------------------------------------------------------------------+
