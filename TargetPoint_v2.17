@@ -1,0 +1,2885 @@
+//+------------------------------------------------------------------+
+//|                                          TargetPoint_v2.17.mq4   |
+//|                        Copyright 2025, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Built by MaximK"
+#property link      ""
+#property version   "2.17"
+#property strict
+#property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
+
+int LastLoggedDirection = 0; // Последнее залогированное направление (1=OnlyBuy, -1=OnlySell)
+int LossSeries = 0;          // Счетчик серии убытков
+double BaseLot = 0.01;       // Базовый лот
+int MaxLossSeries = 3;       // Макс. серия убытков
+bool AllowTradeAfterLoss = false; // Флаг разрешения торговли после убытка
+datetime LastTradeTime = 0;  // Время последней сделки
+int TradeDirection = 0;      // Направление последней сделки (1-buy, -1-sell)
+// ====================== ENUMS =====================================
+enum TradeDirectionEnum { NoTrade = 0, OnlyBuy = 1, OnlySell = 2 };
+enum HLinePickModeEnum  { NearestToPrice = 0, LastCreated = 1 };
+enum BreakevenModeEnum  { BE_Standard = 0, BE_ByDashedHLine = 1 };
+enum StopModeEnum       { SL_ATR_D1 = 0, SL_LocalExtreme = 1 };
+datetime DayStartServer();
+int      CountLosingTradesToday();
+bool     CanTradeToday();
+void     EnforceDailyLossLimit();
+
+// ====================== INPUTS =======================
+// Направление
+input TradeDirectionEnum InputTradeDir       = NoTrade; // Initial Trade Direction
+// Риск/SL/TP
+input double      RiskPercent                = 1.0;     // Risk %
+input double      SL_Percent                 = 0.25;    // SL % ATR(D1)
+input double      TP_RR                      = 5.0;     // TP Risk Reward
+input double BreakevenSLMultiplier           = 2.0;     // Breakeven SL Multiplier 
+extern int BreakevenOffsetPoints             = 10;      // Breakeven Offset
+input int         MaxLosingTradesPerDay      = 1;       // Max loss trades/day (0 = no limit)
+// Паттерны 
+input bool        UseABLimit                 = true;    // Use AB Limit pattern
+input bool        UseABMarket                = true;    // Use AB Market pattern
+input bool        UseDailyExtremeBreak       = false;    // Use DailyExtremeBreak pattern
+input bool        UsePinBar                  = true;    // Use Pin Bar pattern
+input bool        UseEngulfing               = true;    // Use Engulfing pattern
+// Общее для всех паттернов
+input bool        UseExtremeSL               = false;   // Use SL beyond extreme (applies to DEB & PinBar)
+// Окна и ATR
+input int         SearchWindowBars           = 200;     // Search Window Bars (H1) for patterns (line mode)
+input int         AB_Distance                = 10;       // расстояние между баром A и баром B
+input int         MaxGapBarsBetweenSignals   = 10;      // Max Bars Between Signals / also pending expiry
+input int         H1_AvgRangePeriod          = 24;      // ATR(H1)
+input int         D1_AvgRangePeriod          = 20;      // ATR(D1)
+// Фильтр диапазона H1 (общий, применяется в Pin Bar)
+input bool        UseAtrH1RangeFilter        = true;    // ATR(H1) range filter for Pin Bar
+input double      MinRangeATRH1              = 0.8;     // Min candle range of ATR(H1) for Pin Bar
+// Прочие
+input double      MinImpulseATR              = 1.0;     // Min Impulse ATR
+input double      CloseZonePercent           = 40.0;    // Close candle Zone%
+input bool        Debug                      = true;    // Debug Mode
+input bool        ShowImpulseDots            = true;    // Show Impulse Arrows
+input int         ImpulseScanBars            = 200;     // Impulse Scan Bars
+input int         ImpulseDotCode             = 159;     // Impulse Dot Code (Wingdings)
+input int         ImpulseOffsetPoints        = 5;       // Impulse Offset Points
+input int         MagicNumber                = 20250930;// Magic number
+input int         StartHour                  = 6;       // Start hour
+input int         StartMinute                = 0;       // Start minute
+input int         EndHour                    = 22;      // End hour
+input int         EndMinute                  = 0;       // End minute
+// Pin Bar только режим источника SL (без отдельного коэффициента ATR)
+input StopModeEnum PinBarStopMode            = SL_ATR_D1; // Pin Bar SL source
+
+// === Day helpers & daily loss limit =================================
+datetime DayStartServer() { return iTime(Symbol(), PERIOD_D1, 0); } // старт дня по времени брокера
+
+int CountLosingTradesToday()
+{
+   const double EPS = 1e-8;
+   datetime dayStart = DayStartServer();
+   int losses = 0;
+
+   int total = OrdersHistoryTotal();
+   for(int i=0; i<total; i++)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != _Symbol)                  continue;
+      if(OrderMagicNumber() != MagicNumber)         continue;
+
+      int t = OrderType();
+      if(t!=OP_BUY && t!=OP_SELL)                   continue; // только закрытые рыночные
+      datetime ct = OrderCloseTime();
+      if(ct < dayStart)                              continue; // только текущий день
+
+      double pnl = OrderProfit() + OrderSwap() + OrderCommission();
+      if(pnl < -EPS) losses++;
+   }
+   return losses;
+}
+
+bool CanTradeToday()
+{
+   if(MaxLosingTradesPerDay <= 0) return true;
+   return (CountLosingTradesToday() < MaxLosingTradesPerDay);
+}
+
+// печать один раз в день при блокировке + снятие pending
+void EnforceDailyLossLimit()
+{
+   static datetime lastDay = 0;
+   static bool blocked = false;
+
+   datetime today = DayStartServer();
+   if(today != lastDay) { lastDay = today; blocked = false; } // новый день — разблок
+
+   if(MaxLosingTradesPerDay > 0 && CountLosingTradesToday() >= MaxLosingTradesPerDay)
+   {
+      if(!blocked){
+         if(Debug) Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
+                         CountLosingTradesToday()," limit=",MaxLosingTradesPerDay,
+                         " dayStart=",TimeToString(today));
+         blocked = true;
+      }
+      CancelAllPendings();
+   }
+}
+// ====================== ЖЁСТКИЕ НАСТРОЙКИ =========================
+const HLinePickModeEnum kHLinePickMode     = NearestToPrice;
+const HLinePickModeEnum kBE_HLinePickMode  = NearestToPrice;
+const bool  kReplacePendingOnNewPattern    = true;
+const bool  kOnePositionOnly               = true;
+const double kMaxSpreadPoints              = -1;        // (-1 отключено)
+const int    kMaxSlippagePoints            = 20;
+// "NoLine" рынок/лимит
+const int    kNoLine_PatternScanBars       = 5;
+const bool   kNoLine_UsePending            = true;
+const bool   kNoLine_UseMarket             = true;
+// Визуал
+const color  kImpulseBullDotColor          = clrLime;
+const color  kImpulseBearDotColor          = clrRed;
+// BE offset скрыт из меню
+const int    kBreakevenOffsetPoints        = 10;        // скрытый дефолт
+// ====================== КНОПКИ ДИРЕКШНА ===========================
+const string kBuyButtonName      = "TP_BUY_BTN";
+const string kSellButtonName     = "TP_SELL_BTN";
+const string kOffButtonName      = "TP_OFF_BTN";
+const string kBEButtonName       = "TP_BE_BTN";
+const string kLimitButtonName    = "TP_LIMIT_BTN";
+const string kTPButtonName       = "TP_TP_BTN";
+const string kCloseAllButtonName = "TP_CLOSEALL_BTN";
+const color  kButtonTextColor    = clrBlack;
+const color  kInactiveBGColor    = clrWhite;
+const color  kBuyActiveBGColor   = clrLime;
+const color  kSellActiveBGColor  = clrRed;
+const color  kOffActiveBGColor   = clrGray;
+const color  kBEButtonBGColor    = clrYellow;
+const color  kLimitButtonBGColor = clrAqua;
+const color  kTPButtonBGColor    = clrRed;
+const color  kCloseAllButtonBGColor = clrPink;
+
+// ====================== Глобальные ================================
+int CurrentTradeDir = NoTrade;
+BreakevenModeEnum CurrentBreakevenMode = BE_Standard;
+
+double   Level = 0.0;
+string   SelectedHLineName = "";
+
+string   LimitLineName = "TP_LIMIT_LINE";
+double   LimitLevel = 0.0;
+bool     LimitActive = false;
+
+const string kTPOverrideLineName = "TP_OVERRIDE_LINE";
+double   TPOverrideLevel = 0.0;
+bool     TPOverrideActive = false;
+bool     TPOverridePendingRestore = false;
+
+ulong    g_tpLineCreatedLogTick = 0;
+ulong    g_tpLineRemovedLogTick = 0;
+ulong    g_tpOverrideAppliedLogTick = 0;
+ulong    g_tpRestoredLogTick = 0;
+
+struct Pattern {
+   int A_shift;
+   int B_shift;
+   double OpenA;
+   datetime A_time;
+   datetime B_time;
+   string Key;
+};
+static int lastPendingManageTicket = 0;
+
+Pattern CurrentPattern = { -1, -1, 0.0, 0, 0, "" };
+
+// --- PIN BAR LOGIC ---
+struct SignalInfo {
+   bool   valid;
+   bool   isBuy;
+   string pattern;
+   double entryPrice;
+   double slPrice;
+   double tpPrice;
+   double localSL;
+};
+SignalInfo CurrentSignal = { false, false, "", 0.0, 0.0, 0.0, 0.0 };
+
+struct SignalCandle {
+   int shift;
+   datetime time;
+   double extreme;      // high for SELL, low for BUY
+   double entry_level;  // low for SELL, high for BUY
+   string Key;
+};
+SignalCandle CurrentSignalBuy  = { -1, 0, 0.0, 0.0, "" };
+SignalCandle CurrentSignalSell = { -1, 0, 0.0, 0.0, "" };
+datetime CurrentDay = 0;
+
+int BE_DoneTickets[100];
+int BE_DoneCount = 0;
+
+datetime LastH1BarTime = 0;
+
+double g_prevBid = 0.0;
+double g_prevAsk = 0.0;
+bool   g_prevInited = false;
+
+double   ATR_H1_avg = 0.0;
+double   ATR_D1_avg = 0.0;
+double   CloseZone  = 0.0;
+
+int      PendingTicket = 0;
+datetime PendingPlaceTime = 0;
+int      PendingPlaceH1BarIndex = 0;
+string   PendingPatternKey = "";
+
+#define MAX_USED_KEYS 512
+string   UsedKeys[MAX_USED_KEYS];
+int      UsedKeysCount = 0;
+
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
+int CountOpenPositions(){
+   int c=0;
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUY||t==OP_SELL) c++;
+   }
+   return c;
+}
+int CountPendings(){
+   int c=0;
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUYLIMIT||t==OP_SELLLIMIT||t==OP_BUYSTOP||t==OP_SELLSTOP) c++;
+   }
+   return c;
+}
+void CancelAllPendings(){
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUYLIMIT||t==OP_SELLLIMIT||t==OP_BUYSTOP||t==OP_SELLSTOP){
+         int tk=OrderTicket();
+         if(!OrderDelete(tk)){
+            Print("CancelAllPendings: fail delete ",tk," err=",GetLastError());
+         }else if(tk==PendingTicket){
+            PendingTicket=0;
+            PendingPatternKey = "";
+         }
+      }
+   }
+}
+void CloseAll(){
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUY){
+         if(!OrderClose(OrderTicket(),OrderLots(),Bid,kMaxSlippagePoints,clrRed)){
+            Print("CloseAll: fail close BUY ",OrderTicket()," err=",GetLastError());
+         }
+      }else if(t==OP_SELL){
+         if(!OrderClose(OrderTicket(),OrderLots(),Ask,kMaxSlippagePoints,clrRed)){
+            Print("CloseAll: fail close SELL ",OrderTicket()," err=",GetLastError());
+         }
+      }
+   }
+   CancelAllPendings();
+   Print("CloseAll executed.");
+}
+bool IsDirectionAllowed(int type){
+   if (CurrentTradeDir==OnlyBuy  && (type==OP_SELL || type==OP_SELLLIMIT || type==OP_SELLSTOP))  return false;
+   if (CurrentTradeDir==OnlySell && (type==OP_BUY  || type==OP_BUYLIMIT || type==OP_BUYSTOP ))  return false;
+   return (CurrentTradeDir!=NoTrade);
+}
+
+bool IsBreakevenProfitOrder(){
+   if (OrderProfit() <= 0) return false;
+
+   int type = OrderType();
+   if (type != OP_BUY && type != OP_SELL) return false;
+
+   double stopLoss = OrderStopLoss();
+   if (stopLoss <= 0) return false;
+
+   double closePrice = OrderClosePrice();
+   double openPrice  = OrderOpenPrice();
+   double priceTolerance = Point * 5; // допуск для учета проскальзывания
+
+   bool closedByStop = (MathAbs(closePrice - stopLoss) <= priceTolerance);
+   if (!closedByStop) return false;
+
+   double stopDeltaPoints = MathAbs(stopLoss - openPrice) / Point;
+   double expectedOffset  = kBreakevenOffsetPoints;
+   double tolerancePoints = 3;
+   double minPoints = MathMax(0.0, expectedOffset - tolerancePoints);
+
+   bool nearExpectedOffset = (stopDeltaPoints >= minPoints &&
+                              stopDeltaPoints <= expectedOffset + tolerancePoints);
+
+   if (IsBEDone(OrderTicket())) return true;
+
+   return nearExpectedOffset;
+}
+
+// Проверка, была ли прибыльная сделка сегодня
+bool HasProfitableTradeToday() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime today_start = TimeCurrent() - (dt.hour * 3600 + dt.min * 60 + dt.sec);
+
+   for(int i=OrdersHistoryTotal()-1; i>=0; i--) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
+      if(OrderCloseTime() < today_start) continue;
+      if(OrderProfit() > 0){
+         if(IsBreakevenProfitOrder()) continue;
+         return true;
+      }
+   }
+   return false;
+}
+// --- линии ---
+bool HasAnyValidSolidHLine(){
+   int total=ObjectsTotal();
+   for(int i=0;i<total;i++){
+      string name=ObjectName(i);
+      if(ObjectType(name)!=OBJ_HLINE) continue;
+      if(StringFind(name,"TP_")==0) continue; // служебные
+      int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+      if(style!=STYLE_SOLID) continue;
+      return true;
+   }
+   return false;
+}
+bool NoLineModeActive(){
+   // Авто-режим: нет торговой SOLID линии => NoLine
+   return !HasAnyValidSolidHLine();
+}
+bool HasDashedLine(){
+   int total=ObjectsTotal();
+   for(int i=0;i<total;i++){
+      string name=ObjectName(i);
+      if(ObjectType(name)!=OBJ_HLINE) continue;
+      if(name==LimitLineName) continue; // Limit линия не должна переключать BE режим
+      if(name==kTPOverrideLineName) continue;
+      // НЕ исключаем TP_BE_LINE — именно её и нужно увидеть
+      int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+      if(style==STYLE_DASH || style==STYLE_DASHDOT || style==STYLE_DASHDOTDOT) return true;
+   }
+   return false;
+}
+void UpdateBreakevenMode(){
+   bool hasDashed = HasDashedLine();
+   if(hasDashed && CurrentBreakevenMode != BE_ByDashedHLine){
+      CurrentBreakevenMode = BE_ByDashedHLine;
+      if (Debug) Print("Dashed line detected. Breakeven mode switched to BE_ByDashedHLine.");
+   }else if(!hasDashed && CurrentBreakevenMode != BE_Standard){
+      CurrentBreakevenMode = BE_Standard;
+      if (Debug) Print("No dashed line. Breakeven mode switched back to BE_Standard.");
+   }
+}
+
+// Проверка сессии
+bool IsInSession(datetime t){
+   int h = TimeHour(t);
+   int m = TimeMinute(t);
+   int start = StartHour*60 + StartMinute;
+   int end   = EndHour*60 + EndMinute;
+   int cur   = h*60 + m;
+   return (cur >= start && cur < end);
+}
+
+// Проверка текущего дня
+bool IsToday(datetime t){
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   MqlDateTime current_dt;
+   TimeToStruct(TimeCurrent(), current_dt);
+   return (dt.day == current_dt.day && dt.mon == current_dt.mon && dt.year == current_dt.year);
+}
+
+// === Breakeven by dashed HLine ===
+bool GetDashedBreakevenLine(double &priceOut,string &lineNameOut){
+   priceOut=0.0; lineNameOut="";
+   int total=ObjectsTotal(); if(total<=0) return false;
+
+   double mid=(Ask+Bid)/2.0;
+   double bestDist=DBL_MAX;
+   string bestName=""; double bestPrice=0.0;
+
+   if(kBE_HLinePickMode==NearestToPrice){
+      for(int i=0;i<total;i++){
+         string name=ObjectName(i);
+         if(ObjectType(name)!=OBJ_HLINE) continue;
+         int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+         if(style==STYLE_SOLID) continue;
+         double price=ObjectGetDouble(0,name,OBJPROP_PRICE,0);
+         if(price==0.0) continue;
+         double d=MathAbs(price-mid);
+         if(d<bestDist){ bestDist=d; bestName=name; bestPrice=price; }
+      }
+   }else{
+      for(int i=total-1;i>=0;i--){
+         string name=ObjectName(i);
+         if(ObjectType(name)!=OBJ_HLINE) continue;
+         int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+         if(style==STYLE_SOLID) continue;
+         double price=ObjectGetDouble(0,name,OBJPROP_PRICE,0);
+         if(price==0.0) continue;
+         bestName=name; bestPrice=price; break;
+      }
+   }
+   if(bestName=="") return false;
+   priceOut=NormalizeDouble(bestPrice,Digits);
+   lineNameOut=bestName;
+   return true;
+}
+void ManageBreakevenByLine(){
+   double beLine=0.0; string lineName="";
+   if(!GetDashedBreakevenLine(beLine,lineName)) return;
+
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      int type=OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      int ticket=OrderTicket();
+      double entry=OrderOpenPrice();
+      double tp=OrderTakeProfit();
+      double offset=kBreakevenOffsetPoints*Point;
+
+      if(IsBEDone(ticket)) continue;
+      if(WasJustActivated(ticket)) continue;
+
+      bool trigger=false;
+      double desiredSL=OrderStopLoss();
+
+      if(type==OP_BUY){
+         if(beLine<=entry) continue;
+         if(CrossedUp(beLine)){
+            desiredSL=NormalizeDouble(entry+offset,Digits);
+            desiredSL=MathMin(desiredSL,Bid-2*Point);
+            if(desiredSL>OrderStopLoss()) trigger=true;
+         }
+      }else{
+         if(beLine>=entry) continue;
+         if(CrossedDown(beLine)){
+            desiredSL=NormalizeDouble(entry-offset,Digits);
+            desiredSL=MathMax(desiredSL,Ask+2*Point);
+            if(desiredSL<OrderStopLoss()) trigger=true;
+         }
+      }
+      if(trigger){
+         if(OrderModify(ticket,entry,desiredSL,tp,0,clrGreen)){
+            if(Debug) PrintFormat("[BE-Line] %s crossed %.5f -> BE set (ticket %d, SL=%.5f)",lineName,beLine,ticket,desiredSL);
+            AddBEDone(ticket);
+         }else{
+            Print("[BE-Line] Error setting breakeven: ",GetLastError()," ticket=",ticket);
+         }
+      }
+   }
+}
+//-------------------------------------------------------------------
+//    Фильтр геометрии относительно SOLID-линии                   |
+//-------------------------------------------------------------------
+bool IsValidByLineGeometry(bool isBuy, double refPrice)
+{
+   if (!HasAnyValidSolidHLine()) return true; // в NoLine режим фильтр не применяется
+
+   if (isBuy)
+      return (refPrice <= Level);   // для покупок цена входа не выше линии
+   else
+      return (refPrice >= Level);   // для продаж цена входа не ниже линии
+}
+//----------------------------------------------------------------------
+//           Управление Limit Line                                   |
+//----------------------------------------------------------------------
+void UpdateLimitLine(){
+   if(ObjectFind(0,LimitLineName) < 0){
+      LimitActive = false;
+      LimitLevel = 0.0;
+      return;
+   }
+   LimitLevel = NormalizeDouble(ObjectGetDouble(0,LimitLineName,OBJPROP_PRICE,0), Digits);
+   LimitActive = true;
+}
+void CreateLimitLine(){
+   double pip = PipSize();
+   double offset = 40.0 * pip;
+   double price;
+   if(CurrentTradeDir == OnlyBuy){
+      price = NormalizeDouble(Ask + offset, Digits);
+   }else if(CurrentTradeDir == OnlySell){
+      price = NormalizeDouble(Bid - offset, Digits);
+   }else{
+      price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+   }
+   if(ObjectFind(0,LimitLineName) >= 0) ObjectDelete(0, LimitLineName);
+   ObjectCreate(0, LimitLineName, OBJ_HLINE, 0, 0, price);
+   ObjectSetInteger(0, LimitLineName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, LimitLineName, OBJPROP_COLOR, clrBlue);
+   ObjectSetInteger(0, LimitLineName, OBJPROP_WIDTH, 1);
+   ChartRedraw();
+   Print("Limit line created at ", DoubleToStr(price, Digits));
+}
+void CheckLimitTouch(){
+   if(!LimitActive || CurrentTradeDir == NoTrade) return;
+   if(kOnePositionOnly && CountOpenPositions() > 0) return;
+
+   bool triggered = false;
+   if(CurrentTradeDir == OnlyBuy){
+      if(CrossedUp(LimitLevel)){
+         triggered = true;
+      }
+   }else if(CurrentTradeDir == OnlySell){
+      if(CrossedDown(LimitLevel)){
+         triggered = true;
+      }
+   }
+   
+   if(triggered){
+      double entry = (CurrentTradeDir == OnlyBuy) ? Ask : Bid;
+      double sl_dist = SL_Percent * ATR_D1_avg;
+      double sl, tp;
+      if(CurrentTradeDir == OnlyBuy){
+         sl = NormalizeDouble(entry - sl_dist, Digits);
+         tp = NormalizeDouble(entry + TP_RR * sl_dist, Digits);
+      }else{
+         sl = NormalizeDouble(entry + sl_dist, Digits);
+         tp = NormalizeDouble(entry - TP_RR * sl_dist, Digits);
+      }
+     double lot = CalculateLot(entry, sl);
+      if(lot > 0){
+         // ⛔️ DAILY LOSS LIMIT — проверка перед отправкой ордера
+         if(!CanTradeToday()){
+            Print("[DAILY-LOSS-LIMIT] Blocked: losses=", CountLosingTradesToday(),
+                  " limit=", MaxLosingTradesPerDay);
+            return; // выходим, ордер не отправляем
+         }
+
+         int type = (CurrentTradeDir == OnlyBuy) ? OP_BUY : OP_SELL;
+         string cmt = "LimitTouch";
+         int ticket = OrderSend(Symbol(), type, lot, entry, kMaxSlippagePoints, sl, tp, cmt, MagicNumber, 0, clrBlue);
+         if(ticket > 0){
+            Print("Limit line touched. Market order opened: ", ticket);
+            ObjectDelete(0, LimitLineName);
+            LimitActive = false;
+            LimitLevel = 0.0;
+         }else{
+            Print("Error opening Limit order: ", GetLastError());
+         }
+      }
+   }
+}
+
+void LogTPEvent(const string msg, ulong &lastTick){
+   if(!Debug) return;
+   ulong now = GetTickCount();
+   if(now == lastTick) return;
+   lastTick = now;
+   Print(msg);
+}
+
+bool HasOpenOrdersOfType(int type){
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      if(OrderType()==type) return true;
+   }
+   return false;
+}
+
+TradeDirectionEnum DetectTPOverrideDirection(){
+   if(CurrentTradeDir==OnlyBuy || CurrentTradeDir==OnlySell)
+      return (TradeDirectionEnum)CurrentTradeDir;
+
+   bool hasBuy = HasOpenOrdersOfType(OP_BUY);
+   bool hasSell = HasOpenOrdersOfType(OP_SELL);
+
+   if(hasBuy && !hasSell) return OnlyBuy;
+   if(hasSell && !hasBuy) return OnlySell;
+
+   return OnlyBuy;
+}
+
+double ComputeTPOverrideDistance(){
+   double dist = SL_Percent * ATR_D1_avg;
+   if(dist <= 0.0){
+      CalculateATRs();
+      dist = SL_Percent * ATR_D1_avg;
+   }
+   if(dist <= 0.0){
+      dist = 40.0 * PipSize();
+   }
+   return MathAbs(dist);
+}
+
+double ComputeTPLinePrice(TradeDirectionEnum dir){
+   double distance = ComputeTPOverrideDistance();
+   if(distance <= 0.0) return 0.0;
+
+   double price = 0.0;
+   if(dir == OnlySell){
+      price = Bid - distance;
+   
+   }else{
+    price = Ask + distance;
+   }
+   return NormalizeDouble(price, Digits);
+}
+
+void CreateTPOverrideLine(){
+   if(ObjectFind(0,kTPOverrideLineName) >= 0) return;
+
+   TradeDirectionEnum dir = DetectTPOverrideDirection();
+   double price = ComputeTPLinePrice(dir);
+   if(price <= 0.0) return;
+
+   if(!ObjectCreate(0, kTPOverrideLineName, OBJ_HLINE, 0, 0, price)){
+      Print("Failed to create TP override line. err=", GetLastError());
+      return;
+   }
+   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_WIDTH, 1);
+
+   TPOverrideLevel = price;
+   TPOverrideActive = true;
+   TPOverridePendingRestore = false;
+   ChartRedraw();
+
+   LogTPEvent(StringFormat("TP LINE CREATED, price=%s", DoubleToStr(price, Digits)), g_tpLineCreatedLogTick);
+}
+
+void RemoveTPOverrideLine(){
+   bool hadLine = (ObjectFind(0,kTPOverrideLineName) >= 0);
+   if(hadLine){
+      if(!ObjectDelete(0, kTPOverrideLineName)){
+         Print("Failed to delete TP override line. err=", GetLastError());
+      }else{
+         ChartRedraw();
+      }
+   }
+
+   if(TPOverrideActive || hadLine){
+      TPOverrideActive = false;
+      TPOverrideLevel = 0.0;
+      TPOverridePendingRestore = true;
+      LogTPEvent("TP LINE REMOVED", g_tpLineRemovedLogTick);
+   }
+}
+
+void ToggleTPOverrideLine(){
+   if(ObjectFind(0,kTPOverrideLineName) >= 0){
+      RemoveTPOverrideLine();
+   }else{
+      CreateTPOverrideLine();
+   }
+}
+
+void UpdateTPOverrideLineState(){
+   if(ObjectFind(0,kTPOverrideLineName) < 0){
+      if(TPOverrideActive){
+         TPOverrideActive = false;
+         TPOverrideLevel = 0.0;
+         TPOverridePendingRestore = true;
+         LogTPEvent("TP LINE REMOVED", g_tpLineRemovedLogTick);
+      }
+      return;
+   }
+
+   double price = NormalizeDouble(ObjectGetDouble(0, kTPOverrideLineName, OBJPROP_PRICE, 0), Digits);
+   TPOverrideLevel = price;
+   if(!TPOverrideActive){
+      TPOverrideActive = true;
+      TPOverridePendingRestore = false;
+   }
+}
+
+void ApplyTPOverride(){
+   if(!TPOverrideActive) return;
+
+   double target = TPOverrideLevel;
+   if(target <= 0.0) return;
+
+   bool modified = false;
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int type = OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      double entry = OrderOpenPrice();
+      double sl    = OrderStopLoss();
+      double newTP = NormalizeDouble(target, Digits);
+      double currentTP = OrderTakeProfit();
+      double tol = Point/2.0;
+
+      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
+
+      if(type==OP_BUY && newTP <= entry) continue;
+      if(type==OP_SELL && newTP >= entry) continue;
+
+      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE)){
+         modified = true;
+      }else{
+         Print("Failed to apply TP override for ticket ", OrderTicket(), " err=", GetLastError());
+      }
+   }
+
+   if(modified){
+      LogTPEvent("TP OVERRIDE APPLIED", g_tpOverrideAppliedLogTick);
+   }
+}
+
+void RestoreTPToRR(){
+   bool modified = false;
+   bool attempted = false;
+   bool failed = false;
+
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int type = OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      double entry = OrderOpenPrice();
+      double sl    = OrderStopLoss();
+      if(sl <= 0.0) continue;
+
+      double dist = MathAbs(entry - sl);
+      if(dist <= Point/2.0) continue;
+
+      double newTP = (type==OP_BUY) ? (entry + TP_RR * dist) : (entry - TP_RR * dist);
+      newTP = NormalizeDouble(newTP, Digits);
+
+      double currentTP = OrderTakeProfit();
+      double tol = Point/2.0;
+      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
+
+      attempted = true;
+      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE)){
+         modified = true;
+      }else{
+         failed = true;
+         Print("Failed to restore TP for ticket ", OrderTicket(), " err=", GetLastError());
+      }
+   }
+
+   if(modified){
+      LogTPEvent("TP RESTORED TO RR MODE", g_tpRestoredLogTick);
+   }
+
+   if(!attempted || !failed){
+      TPOverridePendingRestore = false;
+   }
+}
+
+void HandleTPOverrideOnTick(){
+   if(TPOverrideActive){
+      ApplyTPOverride();
+   }else if(TPOverridePendingRestore){
+      RestoreTPToRR();
+   }
+}
+//---------------------------------------------------
+// Кнопки направления                               |
+//---------------------------------------------------
+void CreateDirectionButtons(){
+   int btn_width=60, btn_height=25, y_pos=30, x_start=10;
+
+   if (ObjectFind(0,kBuyButtonName)<0) ObjectCreate(0,kBuyButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_XDISTANCE,x_start);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kBuyButtonName,OBJPROP_TEXT,"BUY");
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlyBuy? kBuyActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kSellButtonName)<0) ObjectCreate(0,kSellButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_XDISTANCE,x_start+btn_width+5);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kSellButtonName,OBJPROP_TEXT,"SELL");
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlySell? kSellActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kOffButtonName)<0) ObjectCreate(0,kOffButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_XDISTANCE,x_start+2*(btn_width+5));
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kOffButtonName,OBJPROP_TEXT,"OFF");
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==NoTrade? kOffActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kBEButtonName)<0) ObjectCreate(0,kBEButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_XDISTANCE,x_start+3*(btn_width+5));
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kBEButtonName,OBJPROP_TEXT,"BE");
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_BGCOLOR,kBEButtonBGColor);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kLimitButtonName)<0) ObjectCreate(0,kLimitButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_XDISTANCE,x_start+4*(btn_width+5));
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kLimitButtonName,OBJPROP_TEXT,"Limit");
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_BGCOLOR,kLimitButtonBGColor);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+   
+   if (ObjectFind(0,kTPButtonName)<0) ObjectCreate(0,kTPButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_XDISTANCE,x_start+5*(btn_width+5));
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kTPButtonName,OBJPROP_TEXT,"TP");
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_BGCOLOR,kTPButtonBGColor);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+   
+   if (ObjectFind(0,kCloseAllButtonName)<0) ObjectCreate(0,kCloseAllButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_XDISTANCE,x_start+6*(btn_width+5));
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kCloseAllButtonName,OBJPROP_TEXT,"CloseAll");
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_BGCOLOR,kCloseAllButtonBGColor);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+
+   ChartRedraw();
+}
+void UpdateButtonColors(){
+   ObjectSetInteger(0,kBuyButtonName, OBJPROP_BGCOLOR,(CurrentTradeDir==OnlyBuy ? kBuyActiveBGColor : kInactiveBGColor));
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlySell? kSellActiveBGColor: kInactiveBGColor));
+   ObjectSetInteger(0,kOffButtonName, OBJPROP_BGCOLOR,(CurrentTradeDir==NoTrade ? kOffActiveBGColor  : kInactiveBGColor));
+   ChartRedraw();
+   if (Debug) Print("Trade Direction changed to: ", (CurrentTradeDir==OnlyBuy?"OnlyBuy":(CurrentTradeDir==OnlySell?"OnlySell":"NoTrade")));
+}
+void CheckButtonStates(){
+   if (ObjectGetInteger(0,kBuyButtonName,OBJPROP_STATE)){
+      CurrentTradeDir=OnlyBuy;
+      ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+      if (Debug) Print("[Button] BUY clicked (tester workaround)");
+   }
+   if (ObjectGetInteger(0,kSellButtonName,OBJPROP_STATE)){
+      CurrentTradeDir=OnlySell;
+      ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+      if (Debug) Print("[Button] SELL clicked (tester workaround)");
+   }
+   if (ObjectGetInteger(0,kOffButtonName,OBJPROP_STATE)){
+      CurrentTradeDir=NoTrade;
+      ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+      if (Debug) Print("[Button] OFF clicked (tester workaround)");
+   }
+
+   if (ObjectGetInteger(0,kBEButtonName,OBJPROP_STATE)){
+      ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+      double pip = PipSize();
+      double offset = 30.0 * pip;
+      double price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+      string beLineName = "TP_BE_LINE";
+      if(ObjectFind(0,beLineName) >= 0) ObjectDelete(0, beLineName);
+      ObjectCreate(0,beLineName, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0,beLineName, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0,beLineName, OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0,beLineName, OBJPROP_WIDTH, 1);
+      ChartRedraw();
+      Print("BE line created at ", DoubleToStr(price, Digits));
+   }
+   if (ObjectGetInteger(0,kLimitButtonName,OBJPROP_STATE)){
+      ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+      CreateLimitLine();
+   }
+   if (ObjectGetInteger(0,kTPButtonName,OBJPROP_STATE)){
+      ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+      ToggleTPOverrideLine();
+   }
+
+   if (ObjectGetInteger(0,kCloseAllButtonName,OBJPROP_STATE)){
+      ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+      CloseAll();
+   }
+}
+//---------------------------------------------------------
+// АНТИ-ПОВТОР ПАТТЕРНА                                 |
+//---------------------------------------------------------
+string ComposePatternKey(bool lineMode,bool isBuy,datetime a_time,datetime b_time){
+   string mode=lineMode?"LINE":"NL";
+   string dir =isBuy?"BUY":"SELL";
+   string lkey=lineMode?SelectedHLineName:"NL";
+   return StringFormat("%s|%s|%d|%d|%s",mode,dir,a_time,b_time,lkey);
+}
+bool IsKeyUsed(string key){ if(key=="")return false; for(int i=0;i<UsedKeysCount;i++) if(UsedKeys[i]==key) return true; return false; }
+void AddUsedKey(string key){
+   if(key==""||IsKeyUsed(key))return;
+   if(UsedKeysCount<MAX_USED_KEYS){ UsedKeys[UsedKeysCount++]=key; if(Debug) Print("[AntiRepeat] Mark used: ",key); }
+   else if(Debug) Print("[AntiRepeat] Buffer full, cannot add: ",key);
+}
+bool TryParseKeyFromComment(string cmt,string &keyOut){
+   int pos=StringFind(cmt,"PK:");
+   if(pos<0) return false;
+   keyOut=StringSubstr(cmt,pos+3);
+   StringTrimLeft(keyOut); StringTrimRight(keyOut);
+   return (keyOut!="");
+}
+
+// --- PIN BAR LOGIC ---
+// Вспомогательные функции для свечей (H1 timeframe)
+double CandleOpen(int shift)  { return iOpen(Symbol(), PERIOD_H1, shift); }
+double CandleClose(int shift) { return iClose(Symbol(), PERIOD_H1, shift); }
+double CandleHigh(int shift)  { return iHigh(Symbol(),  PERIOD_H1, shift); }
+double CandleLow(int shift)   { return iLow(Symbol(),   PERIOD_H1, shift); }
+double CandleRange(int shift) { return CandleHigh(shift) - CandleLow(shift); }
+
+// Нормализация и вспомогательные
+double Norm(double p) { return NormalizeDouble(p, Digits); }
+double Pt() { return Point; }
+
+// Фильтр ATR H1 для диапазона свечи
+bool PassAtrH1RangeFilter(int shift){
+   if(!UseAtrH1RangeFilter) return true;
+   if(ATR_H1_avg <= 0) return false;
+   double rng = CandleRange(shift);
+   return (rng >= MinRangeATRH1 * ATR_H1_avg);
+}
+
+// Фильтр экстремума дня для Pin Bar
+bool AlmostEqual(double a, double b){ double eps = MathMax(Point*0.5, 1e-10); return (MathAbs(a-b) <= eps); }
+bool PassDayExtremeFilter(bool isBuy){
+   double dayHigh = iHigh(Symbol(), PERIOD_D1, 0);
+   double dayLow  = iLow (Symbol(), PERIOD_D1, 0);
+   if(isBuy) return AlmostEqual(CandleLow(1), dayLow);
+   else      return AlmostEqual(CandleHigh(1), dayHigh);
+}
+//-----------------------------------------------------
+// Определение Pin Bar на закрытой свече            |
+//-----------------------------------------------------
+bool Detect_PinBar(int shift, bool &isBuy){
+   double O = CandleOpen(shift);
+   double C = CandleClose(shift);
+   double H = CandleHigh(shift);
+   double L = CandleLow(shift);
+
+   double body = MathAbs(C - O);
+   double upper = H - MathMax(O, C);
+   double lower = MathMin(O, C) - L;
+
+   double longW = upper; double shortW = lower; bool longIsUpper = true;
+   if(lower > upper){ longW = lower; shortW = upper; longIsUpper = false; }
+
+   bool cond1 = (longW >= 2.0 * body);
+   bool cond2 = (longW >= 2.0 * shortW);
+
+   if(!(cond1 && cond2)) return false;
+   if(!PassAtrH1RangeFilter(shift)) return false;
+
+   isBuy = (!longIsUpper);
+   return true;
+}
+
+// -------------------------------------------------------------------
+// Построение сигнала Pin Bar с проверкой дневного экстремума + окна
+// -------------------------------------------------------------------
+// ===== Helpers: окно + экстремумы дня (00:00..23:59 брокера) =====
+bool IsWithinTradeWindow(datetime t, int startHour, int startMin, int endHour, int endMin)
+{
+   MqlDateTime md; TimeToStruct(t, md);
+   int cur = md.hour*60 + md.min;
+   int beg = startHour*60 + startMin;
+   int end = endHour*60 + endMin;
+
+   if(beg==end) return true; // 24/7
+
+   if(beg < end) return (cur >= beg && cur < end);      // дневное окно
+   return (cur >= beg || cur < end);                    // ночное окно (наперекат)
+}
+
+void GetDayHighLow(datetime bar_time, double &dayHigh, double &dayLow)
+{
+   MqlDateTime md; TimeToStruct(bar_time, md);
+   md.hour=0; md.min=0; md.sec=0;
+   datetime dayStart = StructToTime(md);
+   datetime dayEnd   = dayStart + 24*60*60;
+
+   dayHigh = -DBL_MAX; dayLow = DBL_MAX;
+
+   for(int s=0;; s++)
+   {
+      datetime t = iTime(NULL, PERIOD_H1, s);
+      if(t==0) break;
+      if(t < dayStart) break;
+      if(t >= dayEnd) continue;
+
+      double h = iHigh(NULL, PERIOD_H1, s);
+      double l = iLow (NULL, PERIOD_H1, s);
+      if(h > dayHigh) dayHigh = h;
+      if(l < dayLow ) dayLow  = l;
+   }
+}
+
+// ===== Гейт: окно + верный экстремум (BUY=Low дня, SELL=High дня) =====
+bool PinBar_DailyExtremeAndWindowGate(int shift, bool isBuy)
+{
+   datetime bar_time = iTime(NULL, PERIOD_H1, shift);
+   if(bar_time==0) return false;
+
+   if(!IsWithinTradeWindow(bar_time, StartHour, StartMinute, EndHour, EndMinute))
+      return false;
+
+   double dayHigh, dayLow; GetDayHighLow(bar_time, dayHigh, dayLow);
+   double thisHigh = iHigh(NULL, PERIOD_H1, shift);
+   double thisLow  = iLow (NULL, PERIOD_H1, shift);
+
+   double eps = (Point>0 ? Point*0.5 : 1e-10);
+
+   if(isBuy)  return (MathAbs(thisLow  - dayLow ) <= eps); // BUY: Low дня
+   else       return (MathAbs(thisHigh - dayHigh) <= eps); // SELL: High дня
+}
+bool BuildSignal_PinBar(SignalInfo &sig){
+   if(!UsePinBar) return false;
+
+   bool isBuy = false;
+   if(!Detect_PinBar(1, isBuy)) return false;
+
+   if(CurrentTradeDir==OnlyBuy && !isBuy) return false;
+   if(CurrentTradeDir==OnlySell &&  isBuy) return false;
+
+   // ✅ Проверка дневного экстремума по всему дню + торговое окно
+   if(!PinBar_DailyExtremeAndWindowGate(1, isBuy))
+      return false;
+
+   if(!PassDayExtremeFilter(isBuy)) return false;
+
+   sig.valid = true;
+   sig.pattern = "PIN";
+   sig.isBuy = isBuy;
+   sig.entryPrice = isBuy ? Ask : Bid;
+   sig.localSL = isBuy ? CandleLow(1) : CandleHigh(1);
+
+   FillSL_TP_PinBar(sig);
+   return true;
+}
+// Расчет SL/TP для Pin Bar (UseExtremeSL общий)
+void FillSL_TP_PinBar(SignalInfo &sig){
+   double sl = 0.0;
+
+   if (UseExtremeSL){
+      // SL за экстремумом пин-бара с ограничением 0.3 ATR(D1)
+      double beyond = sig.isBuy ? sig.localSL - Point : sig.localSL + Point;
+      double maxDist = 0.3 * ATR_D1_avg;
+      double rawDist = MathAbs(sig.entryPrice - beyond);
+      if (rawDist > maxDist){
+         sl = sig.isBuy ? sig.entryPrice - maxDist : sig.entryPrice + maxDist;
+         if(Debug) Print(StringFormat("[PIN] Extreme SL clamped to 0.3 ATR(D1): was %.5f, now %.5f", beyond, sl));
+      }else{
+         sl = beyond;
+      }
+   }else{
+      if(PinBarStopMode == SL_ATR_D1){
+         double dist = SL_Percent * ATR_D1_avg; // общий коэффициент
+         sl = sig.isBuy ? sig.entryPrice - dist : sig.entryPrice + dist;
+      }else{ // SL_LocalExtreme
+         sl = sig.localSL;
+         double maxDist = 0.3 * ATR_D1_avg;
+         double rawDist = MathAbs(sig.entryPrice - sl);
+         if(rawDist > maxDist){
+            sl = sig.isBuy ? sig.entryPrice - maxDist : sig.entryPrice + maxDist;
+            if(Debug) Print(StringFormat("[PIN] Local SL clamped to 0.3 ATR(D1): adj=%.5f", sl));
+         }
+      }
+   }
+
+   double minDist = 10 * Pt();
+   if(sig.isBuy){
+      if((sig.entryPrice - sl) < minDist) sl = sig.entryPrice - minDist;
+   }else{
+      if((sl - sig.entryPrice) < minDist) sl = sig.entryPrice + minDist;
+   }
+   sig.slPrice = Norm(sl);
+
+   if(TP_RR >= 1.0){
+      double distSL = MathAbs(sig.entryPrice - sig.slPrice);
+      double tp = sig.isBuy ? (sig.entryPrice + TP_RR * distSL) : (sig.entryPrice - TP_RR * distSL);
+      sig.tpPrice = Norm(tp);
+   }else{
+      sig.tpPrice = 0.0;
+   }
+}
+// ===================== ENGULFING: detect + gates =====================
+bool Detect_Engulfing(int shift, bool &isBuy, double &limitPrice, double &localSL){
+   // shift=1 — закрытая поглощающая свеча, shift+1 — поглощённая
+   double O1 = CandleOpen(shift);
+   double C1 = CandleClose(shift);
+   double H1 = CandleHigh(shift);
+   double L1 = CandleLow(shift);
+
+   double O2 = CandleOpen(shift+1);
+   double C2 = CandleClose(shift+1);
+   double H2 = CandleHigh(shift+1);
+   double L2 = CandleLow(shift+1);
+
+   bool bodyBear = (C1 < O1);
+   bool bodyBull = (C1 > O1);
+
+   // Полное поглощение по экстремумам (тени + тело)
+   bool fullEngulf = (H1 >= H2) && (L1 <= L2);
+
+   // Поглощение ТЕЛА свечи 2 телом свечи 1
+   double body1_low  = MathMin(O1, C1);
+   double body1_high = MathMax(O1, C1);
+   double body2_low  = MathMin(O2, C2);
+   double body2_high = MathMax(O2, C2);
+   bool bodyEngulf   = (body1_high >= body2_high) && (body1_low <= body2_low);
+
+   // Обязательны ОБА условия: экстремумы и тела
+   if(!fullEngulf || !bodyEngulf) return false;
+
+   // Направление от тела поглощающей свечи
+   if(bodyBear){
+      isBuy      = false;
+      limitPrice = L2;  // SELL: лимит на Low поглощённой
+      localSL    = H1;  // локальный экстремум для SL (поглощающая)
+      return true;
+   }else if(bodyBull){
+      isBuy      = true;
+      limitPrice = H2;  // BUY: лимит на High поглощённой
+      localSL    = L1;  // локальный экстремум для SL (поглощающая)
+      return true;
+   }
+   return false;
+}
+// Экстремум проверяется ИМЕННО по поглощающей свече (логика пользователя)
+bool Engulfing_DailyExtremeGate(int shift, bool isBuy){
+   datetime bar_time = iTime(NULL, PERIOD_H1, shift);
+   if(bar_time==0) return false;
+
+   double dayHigh, dayLow; GetDayHighLow(bar_time, dayHigh, dayLow);
+   double thisHigh = iHigh(NULL, PERIOD_H1, shift);
+   double thisLow  = iLow (NULL, PERIOD_H1, shift);
+
+   double eps = (Point>0 ? Point*0.5 : 1e-10);
+   if(isBuy)  return (MathAbs(thisLow  - dayLow ) <= eps); // BUY: Low дня
+   else       return (MathAbs(thisHigh - dayHigh) <= eps); // SELL: High дня
+}
+
+bool Engulfing_InTradeWindow(int shift){
+   datetime bar_time = iTime(NULL, PERIOD_H1, shift);
+   if(bar_time==0) return false;
+   return IsWithinTradeWindow(bar_time, StartHour, StartMinute, EndHour, EndMinute);
+}
+
+// Построение сигнала Engulfing (лимитный вход на экстремуме поглощённой)
+bool BuildSignal_Engulfing(SignalInfo &sig){
+   if(!UseEngulfing) return false;
+
+   bool isBuy=false;
+   double limitPrice=0.0, localSL=0.0;
+   if(!Detect_Engulfing(1, isBuy, limitPrice, localSL)) return false;
+
+   if(CurrentTradeDir==OnlyBuy && !isBuy)  return false;
+   if(CurrentTradeDir==OnlySell &&  isBuy) return false;
+
+   // проверка торгового окна и дневного экстремума именно для поглощающей свечи
+   if(!Engulfing_InTradeWindow(1))               return false;
+   if(!Engulfing_DailyExtremeGate(1, isBuy))     return false;
+
+   // общий фильтр диапазона H1 при необходимости (опционально, как и для PinBar)
+   if(!PassAtrH1RangeFilter(1)) return false;
+
+   sig.valid      = true;
+   sig.isBuy      = isBuy;
+   sig.pattern    = "ENG";
+   sig.entryPrice = NormalizeDouble(limitPrice, Digits);
+   sig.localSL    = localSL;
+
+   // SL/TP по общей метрике ATR(D1)
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   double tp_dist = TP_RR      * sl_dist;
+   sig.slPrice = NormalizeDouble(isBuy ? sig.entryPrice - sl_dist
+                                       : sig.entryPrice + sl_dist, Digits);
+   sig.tpPrice = NormalizeDouble(isBuy ? sig.entryPrice + tp_dist
+                                       : sig.entryPrice - tp_dist, Digits);
+   return true;
+}
+
+// Размещение лимитного ордера для Engulfing
+bool ExecuteSignal_Engulfing(const SignalInfo &sig){
+   if(!sig.valid) return false;
+
+   // стоп/фриз-уровни
+   double stop_level = MarketInfo(Symbol(), MODE_STOPLEVEL)  * Point;
+   double freeze_lvl = MarketInfo(Symbol(), MODE_FREEZELEVEL)* Point;
+   double min_dist   = MathMax(stop_level, freeze_lvl);
+
+   double entry = sig.entryPrice;
+   if(sig.isBuy){
+      entry = MathMin(entry, Ask - min_dist);
+      if(entry > Ask - min_dist) return false; // близко
+   }else{
+      entry = MathMax(entry, Bid + min_dist);
+      if(entry < Bid + min_dist) return false; // близко
+   }
+   entry = NormalizeDouble(entry, Digits);
+
+   // расчёт лота от риска
+   double lot = CalculateLot(entry, sig.slPrice);
+   if(lot <= 0) return false;
+
+   // ⛔ daily loss limit
+   if(!CanTradeToday()) return false;
+
+   bool lineMode = !NoLineModeActive();
+   datetime barTime = iTime(Symbol(), PERIOD_H1, 1);
+   string key = ComposePatternKey(lineMode, sig.isBuy, barTime, 0);
+   if(IsKeyUsed(key)) return false;
+
+   int type = sig.isBuy ? OP_BUYLIMIT : OP_SELLLIMIT;
+   if(!IsDirectionAllowed(type)) return false;
+
+   string cmt = StringFormat("Engulfing|PK:%s", key);
+   int tk = OrderSend(Symbol(), type, lot, entry, kMaxSlippagePoints,
+                      sig.slPrice, sig.tpPrice, cmt, MagicNumber, 0,
+                      sig.isBuy ? clrAqua : clrOrange);
+   if(tk > 0){
+      PendingTicket = tk;
+      PendingPlaceTime = TimeCurrent();
+      PendingPlaceH1BarIndex = 1;
+      PendingPatternKey = key;
+      AddUsedKey(key);
+      if(Debug) PrintFormat("[ENG] Pending %s placed ticket=%d entry=%.5f SL=%.5f TP=%.5f Key=%s",
+                            sig.isBuy?"BuyLimit":"SellLimit", tk, entry, sig.slPrice, sig.tpPrice, key);
+      return true;
+   }else{
+      Print("[ENG] OrderSend failed: ", GetLastError());
+      return false;
+   }
+}
+
+//-----------------------------------------------------
+// Pin Bar market execute                             |
+//-----------------------------------------------------
+bool ExecuteSignal_PinBar(const SignalInfo &sig){
+   if(!sig.valid) return false;
+
+   if(kReplacePendingOnNewPattern) CancelAllPendings();
+
+   int type = sig.isBuy ? OP_BUY : OP_SELL;
+   double entry = sig.entryPrice;
+   double lot = CalculateLot(entry, sig.slPrice);
+   if(lot <= 0) return false;
+
+   // ⛔️ DAILY LOSS LIMIT — проверка перед входом
+   if(!CanTradeToday())
+   {
+      Print("[DAILY-LOSS-LIMIT] Blocked: losses=", CountLosingTradesToday(),
+            " limit=", MaxLosingTradesPerDay);
+      return false;
+   }
+
+   datetime barTime = iTime(Symbol(), PERIOD_H1, 1);
+   bool lineMode = !NoLineModeActive();
+   string key = ComposePatternKey(lineMode, sig.isBuy, barTime, 0);
+   string cmt = StringFormat("PinBar|PK:%s", key);
+
+   int ticket = OrderSend(Symbol(), type, lot, entry, kMaxSlippagePoints,
+                          sig.slPrice, sig.tpPrice, cmt, MagicNumber, 0,
+                          sig.isBuy ? clrGreen : clrRed);
+   if(ticket > 0){
+      AddUsedKey(key);
+      if(kOnePositionOnly) CancelAllPendings();
+      if(Debug) PrintFormat("[PIN] Market %s executed ticket=%d entry=%.5f SL=%.5f TP=%.5f Key=%s",
+                             sig.isBuy ? "Buy" : "Sell", ticket, entry, sig.slPrice, sig.tpPrice, key);
+      return true;
+   }else{
+      Print("[PIN] OrderSend failed: ", GetLastError());
+      return false;
+   }
+}
+//+------------------------------------------------------------------+
+//| Expert initialization OnInit                                     |
+//+------------------------------------------------------------------+
+int OnInit(){
+   CurrentTradeDir = InputTradeDir;
+   CurrentBreakevenMode = BE_Standard; // авто-переключение через UpdateBreakevenMode()
+
+   int h1_period = MathMax(H1_AvgRangePeriod,1);
+   int d1_period = MathMax(D1_AvgRangePeriod,1);
+   if (h1_period!=H1_AvgRangePeriod || d1_period!=D1_AvgRangePeriod)
+      Print("Warning: AvgRangePeriod forced to minimum 1.");
+
+   CloseZone = CloseZonePercent/100.0;
+
+   UpdateLineLevel();
+   UpdateBreakevenMode();
+   UpdateLimitLine();
+   UpdateTPOverrideLineState();
+
+   // сразу посчитаем ATR, чтобы импульсные свечи могли маркироваться с момента запуска
+   CalculateATRs();
+   if(ShowImpulseDots) DrawAllImpulseDots();
+
+   CreateDirectionButtons();
+   UsedKeysCount = 0;
+
+   // Инициализация для DailyExtremeBreak
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   CurrentDay = TimeCurrent() - (dt.hour * 3600 + dt.min * 60 + dt.sec); // Начало текущего дня
+
+   // Инициализация логики без убытка (из v2.01)
+   LossSeries        = 0;
+   BaseLot           = MarketInfo(Symbol(), MODE_MINLOT);
+   AllowTradeAfterLoss = true;
+   LastTradeTime     = 0;
+   TradeDirection    = 0;
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason){
+   ObjectDelete(0,kBuyButtonName);
+   ObjectDelete(0,kSellButtonName);
+   ObjectDelete(0,kOffButtonName);
+   ObjectDelete(0,kBEButtonName);
+   ObjectDelete(0,kLimitButtonName);
+   ObjectDelete(0,kTPButtonName);
+   ObjectDelete(0,kCloseAllButtonName);
+   ObjectDelete(0,LimitLineName);
+   if(reason==REASON_REMOVE) ObjectDelete(0,kTPOverrideLineName);
+   ObjectDelete(0,"TP_BE_LINE");
+   TPOverrideActive = false;
+   TPOverrideLevel = 0.0;
+   TPOverridePendingRestore = false;
+   string prefix="ImpulseDot_";
+   for(int i=ObjectsTotal()-1;i>=0;i--){
+      string name=ObjectName(i);
+      if (StringFind(name,prefix)==0) ObjectDelete(name);
+   }
+}
+void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam){
+   if (id==CHARTEVENT_OBJECT_CLICK){
+      if (sparam==kBuyButtonName){ CurrentTradeDir=OnlyBuy; UpdateButtonColors(); ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false); }
+      if (sparam==kSellButtonName){ CurrentTradeDir=OnlySell; UpdateButtonColors(); ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false); }
+      if (sparam==kOffButtonName){ CurrentTradeDir=NoTrade; UpdateButtonColors(); ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false); }
+      if (sparam==kBEButtonName){
+         double pip = PipSize();
+         double offset = 30.0 * pip;
+         double price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+         string beLineName = "TP_BE_LINE";
+         if(ObjectFind(0,beLineName) >= 0) ObjectDelete(0, beLineName);
+         ObjectCreate(0,beLineName, OBJ_HLINE, 0, 0, price);
+         ObjectSetInteger(0,beLineName, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0,beLineName, OBJPROP_COLOR, clrGreen);
+         ObjectSetInteger(0,beLineName, OBJPROP_WIDTH, 1);
+         ChartRedraw();
+         Print("BE line created at ", DoubleToStr(price, Digits));
+         ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kLimitButtonName){
+         CreateLimitLine();
+         ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kTPButtonName){
+         ToggleTPOverrideLine();
+         ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kCloseAllButtonName){
+         CloseAll();
+         ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+      }
+   }
+}
+// Функция проверки и обновления логики без убытка (из v2.01)
+bool CheckNoLoss()
+{
+   if (OrdersHistoryTotal() == 0) return true;
+   
+   int lastOrder = -1;
+   for (int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY) && OrderSymbol() == Symbol())
+      {
+         lastOrder = i;
+         break;
+      }
+   }
+   
+   if (lastOrder == -1) return true;
+   
+   if(!OrderSelect(lastOrder, SELECT_BY_POS, MODE_HISTORY))
+   {
+      Print("[CheckNoLoss] Failed to select last order, err=", GetLastError());
+      return true;
+   }
+   
+   if (OrderProfit() > 0)
+   {
+      LossSeries = 0;
+      AllowTradeAfterLoss = true;
+      return true;
+   }
+   else
+   {
+      LossSeries++;
+      if (LossSeries >= MaxLossSeries)
+      {
+         AllowTradeAfterLoss = false;
+         return false;
+      }
+      AllowTradeAfterLoss = true;
+      return true;
+   }
+}
+//+------------------------------------------------------------------+
+//| Expert tick |
+//+------------------------------------------------------------------+
+void OnTick(){
+   CheckButtonStates();
+   UpdateTPOverrideLineState();
+   HandleTPOverrideOnTick();
+
+   // --- импульсные свечи: считаем ATR и отмечаем новый бар ВСЕГДА, независимо от торговли ---
+   CalculateATRs();
+   datetime current_h1_time = iTime(NULL,PERIOD_H1,0);
+   bool new_h1_bar = (current_h1_time != LastH1BarTime);
+   if (new_h1_bar){
+      LastH1BarTime = current_h1_time;
+      if (ShowImpulseDots) DrawNewImpulseDot(1);
+   }
+
+   EnforceDailyLossLimit();
+
+   if (CurrentTradeDir == NoTrade) return;
+
+   double spread = (Ask-Bid)/Point;
+   if (kMaxSpreadPoints>0 && spread>kMaxSpreadPoints){
+      if (Debug) Print("Spread too high: ",spread," > ",kMaxSpreadPoints);
+      return;
+   }
+
+   UpdateBreakevenMode();
+   UpdateLimitLine();
+   CheckLimitTouch();
+
+   // Новый день — ресет
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime today_start = TimeCurrent() - (dt.hour * 3600 + dt.min * 60 + dt.sec);
+   if (today_start != CurrentDay) {
+      CurrentDay = today_start;
+      CurrentSignalBuy.shift  = -1;
+      CurrentSignalSell.shift = -1;
+      if (Debug) Print("[DailyExtremeBreak] New day started. Reset signal candles.");
+      CancelAllPendings();
+   }
+
+   // Проверка на прибыльные сделки
+   static datetime lastProfitableLog = 0;
+   datetime today = TimeCurrent() / 86400 * 86400;
+   if (HasProfitableTradeToday()) {
+      if(lastProfitableLog < today && Debug) {
+         Print("Profitable trade today. No further trading.");
+         lastProfitableLog = today;
+      }
+      // торговлю блокируем, но импульсы уже нарисованы выше
+      return;
+   }
+
+   // Лимит убыточных сделок (как было)
+   if (MaxGapBarsBetweenSignals > 0 && CountLosingTradesToday() >= MaxGapBarsBetweenSignals) {
+      // оставлено как в исходной логике
+   }
+
+   // ⛔️ DAILY LOSS LIMIT — глобальный стоп торговли на день
+   static datetime lastLossLimitLog = 0;
+   if(!CanTradeToday())
+   {
+      if(lastLossLimitLog < today && Debug)
+         Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
+               CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
+      lastLossLimitLog = today;
+      CancelAllPendings();
+      return;
+   }
+
+   // Восстановленная логика без убытка (из v2.01)
+   CheckNoLoss();
+   if (!AllowTradeAfterLoss)
+   {
+      if (TimeCurrent() - LastTradeTime > 3600) // Разрешить через час
+      {
+         LossSeries = 0;
+         AllowTradeAfterLoss = true;
+      }
+      else return;
+   }
+
+   bool noLine = NoLineModeActive();
+
+   // --- PIN BAR LOGIC: приоритет ---
+   SignalInfo sig = {false, false, "", 0.0, 0.0, 0.0, 0.0};
+   bool pinExecuted = false;
+   if (new_h1_bar && kOnePositionOnly && CountOpenPositions() == 0 && PendingTicket == 0) {
+      if (BuildSignal_PinBar(sig)) {
+         pinExecuted = ExecuteSignal_PinBar(sig);
+      }
+   }
+
+   // --- ENGULFING (лимит), после Pin Bar, до остальной логики ---
+   bool engPlaced = false;
+   if (new_h1_bar && kOnePositionOnly && CountOpenPositions() == 0 && PendingTicket == 0) {
+      SignalInfo eng = {false, false, "", 0.0, 0.0, 0.0, 0.0};
+      if (BuildSignal_Engulfing(eng)) {
+         engPlaced = ExecuteSignal_Engulfing(eng);
+      }
+   }
+
+   // ======================= NO LINE MODE ============================
+   if (noLine){
+      int currentDir = (CurrentTradeDir==OnlyBuy)?1:(CurrentTradeDir==OnlySell)?-1:0;
+      if (currentDir != LastLoggedDirection) {
+         if (Debug) Print("[MODE=NoLine] Direction=",(CurrentTradeDir==OnlyBuy?"BUY":"SELL"));
+         LastLoggedDirection = currentDir;
+      }
+
+      bool posExists = kOnePositionOnly && (CountOpenPositions()>0);
+
+            if (!pinExecuted && UseABMarket && kNoLine_UseMarket && !posExists && PendingTicket==0){
+         int barA_shift,barB_shift; double entry,sl,tp;
+         bool wantBuy = (CurrentTradeDir==OnlyBuy);
+         if (CheckNewPattern_NoLine(wantBuy,barA_shift,barB_shift,entry,sl,tp)){
+            // дневной экстремум по свече B (NoLine вариант)
+            if (!Engulfing_DailyExtremeGate(barB_shift, wantBuy)){
+               if (Debug) Print("[NOLINE][AB-MKT] Rejected by daily extreme filter");
+            }else{
+               int type = wantBuy ? OP_BUY : OP_SELL;
+               if (IsDirectionAllowed(type)){
+                  double lot = CalculateLot(entry, sl);
+                  if (lot>0){
+                     string cmt=StringFormat("NoLineMKT|PK:%s",CurrentPattern.Key);
+                                          int tk=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,(type==OP_BUY?clrGreen:clrRed));
+                     if (tk>0){
+                        AddUsedKey(CurrentPattern.Key);
+                        if (kOnePositionOnly) CancelAllPendings();
+                        LastTradeTime = TimeCurrent();
+                        TradeDirection = (type==OP_BUY)?1:-1;
+                        if (Debug){
+                           if (type==OP_BUY)
+                              PrintFormat("AB-Market buy  [NoLine]: ticket=%d, entry=%.5f, SL=%.5f, TP=%.5f",
+                                          tk,entry,sl,tp);
+                           else
+                              PrintFormat("AB-Market sell [NoLine]: ticket=%d, entry=%.5f, SL=%.5f, TP=%.5f",
+                                          tk,entry,sl,tp);
+                        }
+                     }else{
+                        Print("[NoLine] Market entry error: ",GetLastError());
+                     }
+                  }
+               }
+            }
+         }
+      }
+
+      if (!pinExecuted && UseDailyExtremeBreak && new_h1_bar && !posExists && PendingTicket==0) {
+         UpdateAndCheckDailyExtreme_NoLine();
+      }
+
+      ManagePending();
+      if (CurrentBreakevenMode==BE_Standard) ManageBreakeven_Standard(); else ManageBreakevenByLine();
+      DrawHUD_NoLine();
+
+      if (kOnePositionOnly && CountOpenPositions()==0 && PendingTicket==0){
+         CurrentPattern.A_shift=-1; CurrentPattern.B_shift=-1; CurrentPattern.OpenA=0.0;
+         CurrentPattern.A_time=0;   CurrentPattern.B_time=0;
+         CurrentPattern.Key = "";
+         static datetime lastResetLog = 0;
+         if(lastResetLog < today){
+            if (Debug) Print("[RESET] No open trades. Search unlocked for new patterns.");
+            lastResetLog = today;
+         }
+      }
+
+      HandleTPOverrideOnTick();
+      g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
+      return;
+   }
+
+   // ======================= LINE MODE ===============================
+   UpdateLineLevel();
+   if (Level==0.0){
+      if (Debug) Print("Error: Invalid line level (no SOLID HLine).");
+      return;
+   }
+
+   bool posExists    = kOnePositionOnly && (CountOpenPositions()>0);
+   bool pendingExist = (PendingTicket>0);
+
+   // Pin Bar (с приоритетом)
+   if (!pinExecuted && new_h1_bar && !posExists && !pendingExist) {
+      if (BuildSignal_PinBar(sig)) {
+         pinExecuted = ExecuteSignal_PinBar(sig);
+      }
+   }
+
+   // ENGULFING (лимит), после Pin Bar, до AB/DEB
+   if (!pinExecuted && new_h1_bar && !posExists && !pendingExist) {
+      SignalInfo eng2 = {false, false, "", 0.0, 0.0, 0.0, 0.0};
+      if (BuildSignal_Engulfing(eng2)) {
+         if (ExecuteSignal_Engulfing(eng2)) {
+            // без доп. действий, дальше управляет общая логика
+         }
+      }
+   }
+
+   // Classic pattern -> pending
+   if (!pinExecuted && UseABLimit && !posExists && !pendingExist && (new_h1_bar || PendingTicket==0))
+      FindLatestPattern();
+
+      // AB-Market
+   static bool buy_pattern_executed=false, sell_pattern_executed=false;
+   static datetime last_b_close_time_buy=0, last_b_close_time_sell=0;
+   if (new_h1_bar){ buy_pattern_executed=false; sell_pattern_executed=false; }
+
+   if (!pinExecuted && UseABMarket && !posExists && !pendingExist){
+      int barA_shift,barB_shift; double entry,sl,tp;
+
+      // BUY
+      if (!buy_pattern_executed && CurrentTradeDir==OnlyBuy){
+         if (CheckNewPattern(true,barA_shift,barB_shift,entry,sl,tp)){
+            datetime b_close_time=iTime(NULL,PERIOD_H1,barB_shift);
+            if (b_close_time!=last_b_close_time_buy){
+               int type=OP_BUY;
+               if (!IsDirectionAllowed(type)){
+                  if (Debug) Print("Blocked BUY by TradeDir");
+               }else{
+                  double lot=CalculateLot(entry,sl);
+                  if (lot>0){
+                     string cmt=StringFormat("NewBuyPattern|PK:%s",CurrentPattern.Key);
+                     int ticket=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,clrGreen);
+                                          if (ticket>0){
+                        AddUsedKey(CurrentPattern.Key);
+                        if (kOnePositionOnly) CancelAllPendings();
+                        PrintFormat("AB-Market buy  [Line]: ticket=%d, entry=%.5f, SL=%.5f, TP=%.5f",
+                                    ticket,entry,sl,tp);
+                        buy_pattern_executed=true; 
+                        last_b_close_time_buy=b_close_time;
+                     }else{
+                        Print("Error opening BUY from new pattern: ",GetLastError());
+                     }
+
+                  }
+               }
+            }
+         }
+      }
+
+      // SELL
+      if (!sell_pattern_executed && CurrentTradeDir==OnlySell){
+         if (CheckNewPattern(false,barA_shift,barB_shift,entry,sl,tp)){
+            datetime b_close_time=iTime(NULL,PERIOD_H1,barB_shift);
+            if (b_close_time!=last_b_close_time_sell){
+               int type=OP_SELL;
+               if (!IsDirectionAllowed(type)){
+                  if (Debug) Print("Blocked SELL by TradeDir");
+               }else{
+                  double lot=CalculateLot(entry,sl);
+                  if (lot>0){
+                     string cmt=StringFormat("NewSellPattern|PK:%s",CurrentPattern.Key);
+                     int ticket=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,clrRed);
+                                          if (ticket>0){
+                        AddUsedKey(CurrentPattern.Key);
+                        if (kOnePositionOnly) CancelAllPendings();
+                        PrintFormat("AB-Market sell [Line]: ticket=%d, entry=%.5f, SL=%.5f, TP=%.5f",
+                                    ticket,entry,sl,tp);
+                        sell_pattern_executed=true; 
+                        last_b_close_time_sell=b_close_time;
+                     }else{
+                        Print("Error opening SELL from new pattern: ",GetLastError());
+                     }
+
+                  }
+               }
+            }
+         }
+      }
+   }
+
+
+   if (!pinExecuted && UseDailyExtremeBreak && new_h1_bar && !posExists && PendingTicket==0) {
+      UpdateAndCheckDailyExtreme_Line();
+   }
+
+   ManagePending();
+   if (CurrentBreakevenMode==BE_Standard) ManageBreakeven_Standard(); else ManageBreakevenByLine();
+   DrawHUD();
+
+   HandleTPOverrideOnTick();
+
+   g_prevBid=Bid; g_prevAsk=Ask; g_prevInited=true;
+}
+
+//+------------------------------------------------------------------+
+//| Pattern check (NoLine market-pattern)                            |
+//+------------------------------------------------------------------+
+bool CheckNewPattern_NoLine(bool isBuy,int &barA_shift,int &barB_shift,double &entry_price,double &sl,double &tp){
+   if (kOnePositionOnly && CountOpenPositions() > 0) return false;
+
+
+   if (CurrentTradeDir == OnlyBuy && !isBuy) return false;
+   if (CurrentTradeDir == OnlySell && isBuy) return false;
+
+
+   int max_scan = MathMin(MathMax(kNoLine_PatternScanBars,5), iBars(NULL,PERIOD_H1)-1);
+   if (max_scan < 3) return false;
+
+
+   for (int a_shift=2; a_shift<=max_scan; a_shift++){
+      int b_shift = a_shift - AB_Distance;
+      datetime b_time = iTime(NULL,PERIOD_H1,b_shift);
+      if(!IsToday(b_time)) continue;
+
+
+      if (!IsImpulseBar(a_shift,true) && !IsImpulseBar(a_shift,false)) continue;
+
+
+      bool a_is_bull = iClose(NULL,PERIOD_H1,a_shift) > iOpen(NULL,PERIOD_H1,a_shift);
+      bool b_is_bull = iClose(NULL,PERIOD_H1,b_shift) > iOpen(NULL,PERIOD_H1,b_shift);
+      if (a_is_bull==b_is_bull) continue;
+
+
+      double lowA=iLow(NULL,PERIOD_H1,a_shift);
+      double lowB=iLow(NULL,PERIOD_H1,b_shift);
+      double highA=iHigh(NULL,PERIOD_H1,a_shift);
+      double highB=iHigh(NULL,PERIOD_H1,b_shift);
+
+
+      double openA=iOpen(NULL,PERIOD_H1,a_shift);
+      double closeA=iClose(NULL,PERIOD_H1,a_shift);
+      double closeB=iClose(NULL,PERIOD_H1,b_shift);
+
+
+      double minA=MathMin(openA,closeA);
+      double maxA=MathMax(openA,closeA);
+
+
+      if (isBuy){
+         if(!(lowB<lowA)) continue;
+         if (closeB<minA || closeB>maxA) continue;
+         if(!IsImpulseBar(b_shift,true)) continue;
+      }else{
+         if(!(highB>highA)) continue;
+         if (closeB<minA || closeB>maxA) continue;
+         if(!IsImpulseBar(b_shift,false)) continue;
+      }
+
+
+      datetime a_time=iTime(NULL,PERIOD_H1,a_shift);
+      string key=ComposePatternKey(false,isBuy,a_time,b_time);
+      if (IsKeyUsed(key)){ if (Debug) Print("[NoLine] Skip market: used key ",key); continue; }
+
+
+      barA_shift=a_shift; barB_shift=b_shift;
+
+
+      entry_price = isBuy ? Ask : Bid;
+
+
+      double sl_dist = SL_Percent * ATR_D1_avg;
+      if (isBuy){ sl=NormalizeDouble(entry_price-sl_dist,Digits); tp=NormalizeDouble(entry_price+TP_RR*sl_dist,Digits); }
+      else      { sl=NormalizeDouble(entry_price+sl_dist,Digits); tp=NormalizeDouble(entry_price-TP_RR*sl_dist,Digits); }
+
+
+      double stop_level=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+      if (MathAbs(entry_price-sl) < stop_level) sl = isBuy ? NormalizeDouble(entry_price-stop_level,Digits) : NormalizeDouble(entry_price+stop_level,Digits);
+      if (MathAbs(tp-entry_price) < stop_level) tp = isBuy ? NormalizeDouble(entry_price+stop_level,Digits) : NormalizeDouble(entry_price-stop_level,Digits);
+
+
+      CurrentPattern.Key   = key;
+      CurrentPattern.A_time= a_time;
+      CurrentPattern.B_time= b_time;
+
+
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| NoLine: classic pattern for pending                              |
+//+------------------------------------------------------------------+
+void FindLatestPattern_NoLine(){
+   if (CurrentTradeDir == NoTrade) return;
+
+
+   int max_bars = MathMin(MathMax(kNoLine_PatternScanBars,5), iBars(NULL,PERIOD_H1)-1);
+   if (max_bars < 1) return;
+
+
+   Pattern new_pattern = { -1, -1, 0.0, 0, 0, "" };
+
+
+   bool is_buy = (CurrentTradeDir == OnlyBuy);
+
+
+   for (int b_shift=1; b_shift<=max_bars; b_shift++){
+      datetime b_time = iTime(NULL,PERIOD_H1,b_shift);
+      if(!IsToday(b_time)) continue;
+      int max_a_search = (MaxGapBarsBetweenSignals==0)? max_bars : MathMin(b_shift+MaxGapBarsBetweenSignals,max_bars);
+      for (int a_shift=b_shift+1; a_shift<=max_a_search; a_shift++){
+         datetime a_time = iTime(NULL,PERIOD_H1,a_shift);
+         if(!IsToday(a_time)) continue;
+         bool a_impulse = IsImpulseBar(a_shift, !is_buy);
+         if (!a_impulse) continue;
+         double close_b = iClose(NULL,PERIOD_H1,b_shift);
+         double open_a  = iOpen (NULL,PERIOD_H1,a_shift);
+         bool ok = is_buy ? (close_b>open_a) : (close_b<open_a);
+         if (ok){
+            if (CurrentPattern.B_shift==-1 || b_shift<new_pattern.B_shift){
+               new_pattern.A_shift=a_shift;
+               new_pattern.B_shift=b_shift;
+               new_pattern.OpenA  =open_a;
+               new_pattern.A_time =a_time;
+               new_pattern.B_time =b_time;
+               new_pattern.Key    =ComposePatternKey(false,is_buy,new_pattern.A_time,new_pattern.B_time);
+            }
+            break;
+         }
+      }
+   }
+
+
+   if (new_pattern.B_shift!=-1){
+      if (IsKeyUsed(new_pattern.Key)){ if (Debug) Print("[NoLine] Skip pending: used key ",new_pattern.Key); return; }
+
+
+      CurrentPattern = new_pattern;
+      double entry_preview = NormalizeDouble(new_pattern.OpenA,Digits);
+
+
+      double stop_level=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+      double freeze_lvl=MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point;
+      double min_dist  = MathMax(stop_level,freeze_lvl);
+
+
+      if (CurrentTradeDir==OnlyBuy) entry_preview=MathMin(entry_preview,Ask - min_dist);
+      else                          entry_preview=MathMax(entry_preview,Bid + min_dist);
+
+
+      entry_preview = NormalizeDouble(entry_preview,Digits);
+      DrawPatternMarkers(CurrentPattern,entry_preview);
+      if (kNoLine_UsePending) PlaceOrReplacePending_NoLine();
+   }
+}
+
+void PlaceOrReplacePending_NoLine(){
+   if (CurrentPattern.A_shift==-1) return;
+   if (kOnePositionOnly && CountOpenPositions()>0){ if (Debug) Print("[NoLine] Skip pending: open position exists."); return; }
+
+   if (IsKeyUsed(CurrentPattern.Key)){ if (Debug) Print("[NoLine] Skip pending place: used key ",CurrentPattern.Key); return; }
+
+   double entry = NormalizeDouble(CurrentPattern.OpenA,Digits);
+   int type = (CurrentTradeDir==OnlyBuy)? OP_BUYLIMIT : OP_SELLLIMIT;
+   if (!IsDirectionAllowed(type)){ if (Debug) Print("[NoLine] Blocked pending by TradeDir"); return; }
+
+   double stop_level=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   double freeze_lvl=MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point;
+   double min_dist  = MathMax(stop_level,freeze_lvl);
+
+   if (CurrentTradeDir==OnlyBuy){
+      entry = MathMin(entry,Ask - min_dist);
+      if (entry > Ask - min_dist){ if (Debug) Print("[NoLine] BuyLimit too close to Stop/Freeze"); return; }
+   }else{
+      entry = MathMax(entry,Bid + min_dist);
+      if (entry < Bid + min_dist){ if (Debug) Print("[NoLine] SellLimit too close to Stop/Freeze"); return; }
+   }
+   entry=NormalizeDouble(entry,Digits);
+
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   double tp_dist = TP_RR * sl_dist;
+   double sl = NormalizeDouble((CurrentTradeDir==OnlyBuy)? entry - sl_dist : entry + sl_dist,Digits);
+   double tp = NormalizeDouble((CurrentTradeDir==OnlyBuy)? entry + tp_dist : entry - tp_dist,Digits);
+
+   double min_stop=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   if (MathAbs(sl-entry)<min_stop){
+      sl = (CurrentTradeDir==OnlyBuy)? NormalizeDouble(entry-min_stop,Digits) : NormalizeDouble(entry+min_stop,Digits);
+      if (Debug) Print("[NoLine] SL adjusted to StopLevel.");
+   }
+   if (MathAbs(tp-entry)<min_stop){
+      tp = (CurrentTradeDir==OnlyBuy)? NormalizeDouble(entry+min_stop,Digits) : NormalizeDouble(entry-min_stop,Digits);
+      if (Debug) Print("[NoLine] TP adjusted to StopLevel.");
+   }
+
+   double lot = CalculateLot(entry,sl); if (lot==0.0) return;
+// ⛔️ DAILY LOSS LIMIT — проверка перед установкой pending
+if(!CanTradeToday())
+{
+   Print("[DAILY-LOSS-LIMIT] Pending placement blocked. losses=",
+         CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
+   return;
+}
+   if (PendingTicket>0){
+      if (!kReplacePendingOnNewPattern) return;
+      if (!OrderSelect(PendingTicket,SELECT_BY_TICKET)){ PendingTicket=0; PendingPatternKey = ""; }
+      else{
+         double prev_entry=OrderOpenPrice();
+         bool better = (CurrentTradeDir==OnlyBuy && entry<=prev_entry-Point) || (CurrentTradeDir==OnlySell && entry>=prev_entry+Point);
+         if (!better){ if (Debug) Print("[NoLine] New pattern not better for replace."); return; }
+         if (!OrderDelete(PendingTicket)){ Print("[NoLine] Error deleting pending: ",GetLastError()); return; }
+         PendingTicket=0;
+         PendingPatternKey = "";
+      }
+   }
+
+      string cmt=StringFormat("TargetPoint(NoLine)|PK:%s",CurrentPattern.Key);
+   int ticket=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,clrBlue);
+   if (ticket>0){
+      PendingTicket=ticket;
+      PendingPlaceTime=TimeCurrent();
+      PendingPlaceH1BarIndex=iBars(NULL,PERIOD_H1)-1;
+      PendingPatternKey = CurrentPattern.Key;
+      if (Debug) Print("AB-Limit [NoLine] Placed pending: ",(type==OP_BUYLIMIT?"BuyLimit":"SellLimit"),
+                       " at ",DoubleToStr(entry,Digits)," | ",PendingPatternKey);
+   }else{
+      Print("[NoLine] Error placing pending: ",GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Pattern check (A impulse + B opposite, line-mode)                |
+//+------------------------------------------------------------------+
+bool CheckNewPattern(bool isBuy,int &barA_shift,int &barB_shift,double &entry_price,double &sl,double &tp){
+   if (kOnePositionOnly && (CountOpenPositions()>0 || CountPendings()>0)) return false;
+
+   if (CurrentTradeDir==OnlyBuy && !isBuy) return false;
+   if (CurrentTradeDir==OnlySell && isBuy) return false;
+
+   if (Level==0.0) return false;
+
+   static bool logShownABMKT = false;
+
+   // Нужны как минимум 3 бара: 0 (текущий), 1 (B), 2 (A)
+   if (iBars(NULL,PERIOD_H1) < 3) return false;
+
+   int a_shift = 2;
+   int b_shift = 1;
+
+   datetime b_time = iTime(NULL,PERIOD_H1,b_shift);
+   if (b_time==0) return false;
+
+   // B-должен быть в сессии и сегодня
+   if(!IsInSession(b_time) || !IsToday(b_time)) return false;
+
+   // A — импульсный бар (в любую сторону)
+   if (!IsImpulseBar(a_shift,true) && !IsImpulseBar(a_shift,false)) return false;
+
+   double lowA   = iLow (NULL,PERIOD_H1,a_shift);
+   double lowB   = iLow (NULL,PERIOD_H1,b_shift);
+   double highA  = iHigh(NULL,PERIOD_H1,a_shift);
+   double highB  = iHigh(NULL,PERIOD_H1,b_shift);
+
+   double openA  = iOpen (NULL,PERIOD_H1,a_shift);
+   double closeA = iClose(NULL,PERIOD_H1,a_shift);
+   double closeB = iClose(NULL,PERIOD_H1,b_shift);
+
+   double minA = MathMin(openA,closeA);
+   double maxA = MathMax(openA,closeA);
+
+   // Условия структуры A/B для BUY / SELL
+   if (isBuy){
+      if(!(lowB<lowA)) return false;
+      if (closeB<minA || closeB>maxA) return false;
+      if(!IsImpulseBar(b_shift,true)) return false;
+   }else{
+      if(!(highB>highA)) return false;
+      if (closeB<minA || closeB>maxA) return false;
+      if(!IsImpulseBar(b_shift,false)) return false;
+   }
+
+   // Дневной экстремум по свече B
+   if (!Engulfing_DailyExtremeGate(b_shift, isBuy)){
+      if (Debug) Print("[LINE][AB-MKT] Rejected by daily extreme filter");
+      return false;
+   }
+
+   datetime a_time=iTime(NULL,PERIOD_H1,a_shift);
+   string key=ComposePatternKey(true,isBuy,a_time,b_time);
+   if (IsKeyUsed(key)){
+      if (Debug) Print("[LINE] Skip market: used key ",key);
+      return false;
+   }
+
+   // Геометрия относительно SOLID-линии: только по цене входа
+   entry_price = isBuy ? Ask : Bid;
+   double refPrice = entry_price;
+   if (!IsValidByLineGeometry(isBuy, refPrice)) {
+      if (!logShownABMKT && Debug){
+         Print("[LINE][AB-MKT] Candidate rejected by line geometry");
+         logShownABMKT = true;
+      }
+      return false;
+   } else {
+      logShownABMKT = false;
+   }
+
+   barA_shift=a_shift;
+   barB_shift=b_shift;
+
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   if (isBuy){
+      sl = NormalizeDouble(entry_price-sl_dist,Digits);
+      tp = NormalizeDouble(entry_price+TP_RR*sl_dist,Digits);
+   }else{
+      sl = NormalizeDouble(entry_price+sl_dist,Digits);
+      tp = NormalizeDouble(entry_price-TP_RR*sl_dist,Digits);
+   }
+
+   double stop_level=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   if (MathAbs(entry_price-sl) < stop_level)
+      sl = isBuy ? NormalizeDouble(entry_price-stop_level,Digits)
+                 : NormalizeDouble(entry_price+stop_level,Digits);
+
+   if (MathAbs(tp-entry_price) < stop_level)
+      tp = isBuy ? NormalizeDouble(entry_price+stop_level,Digits)
+                 : NormalizeDouble(entry_price-stop_level,Digits);
+
+   CurrentPattern.Key   = key;
+   CurrentPattern.A_time= a_time;
+   CurrentPattern.B_time= b_time;
+
+   return true;
+}
+//+------------------------------------------------------------------+
+//| Update horizontal line level (SOLID only)                        |
+//+------------------------------------------------------------------+
+void UpdateLineLevel(){
+   double new_level=0.0;
+   string sel_name="";
+   bool   found=false;
+
+   int total=ObjectsTotal();
+
+   if (total>0){
+      if (kHLinePickMode==NearestToPrice){
+         double mid=(Ask+Bid)/2.0;
+         double best=DBL_MAX;
+         for (int i=0;i<total;i++){
+            string name=ObjectName(i);
+            if (ObjectType(name)!=OBJ_HLINE) continue;
+
+            if (StringFind(name,"TP_")==0) continue; // служебные
+            int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+            if (style!=STYLE_SOLID) continue;
+
+            double price=ObjectGetDouble(0,name,OBJPROP_PRICE,0);
+            if (price==0.0) continue;
+            double dist=MathAbs(price-mid);
+            if (dist<best){ best=dist; new_level=price; sel_name=name; found=true; }
+         }
+      }else{
+         for (int i=total-1;i>=0;i--){
+            string name=ObjectName(i);
+            if (ObjectType(name)!=OBJ_HLINE) continue;
+            if (StringFind(name,"TP_")==0) continue;
+            int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+            if (style!=STYLE_SOLID) continue;
+
+            double price=ObjectGetDouble(0,name,OBJPROP_PRICE,0);
+            if (price==0.0) continue;
+            new_level=price; sel_name=name; found=true;
+            break;
+         }
+      }
+   }else{
+      if (Debug) Print("No SOLID HLines on chart.");
+   }
+
+   if (!found){ if (Debug) Print("No valid SOLID trade HLine found. Keeping previous Level."); return; }
+
+   Level=NormalizeDouble(new_level,Digits);
+   SelectedHLineName=sel_name;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate ATR averages                                           |
+//+------------------------------------------------------------------+
+void CalculateATRs(){
+   int h1need=MathMax(H1_AvgRangePeriod,1)+1;
+   int d1need=MathMax(D1_AvgRangePeriod,1)+1;
+   if (iBars(NULL,PERIOD_H1)<h1need || iBars(NULL,PERIOD_D1)<d1need) return;
+
+   double sum_h1=0.0;
+   for (int i=1;i<=H1_AvgRangePeriod;i++)
+      sum_h1 += (iHigh(NULL,PERIOD_H1,i) - iLow(NULL,PERIOD_H1,i));
+   ATR_H1_avg = sum_h1 / MathMax(H1_AvgRangePeriod,1);
+
+   double sum_d1=0.0;
+   for (int i=1;i<=D1_AvgRangePeriod;i++)
+      sum_d1 += (iHigh(NULL,PERIOD_D1,i) - iLow(NULL,PERIOD_D1,i));
+   ATR_D1_avg = sum_d1 / MathMax(D1_AvgRangePeriod,1);
+}
+
+//+------------------------------------------------------------------+
+//| Impulse bar check (thirds rule)                                  |
+//+------------------------------------------------------------------+
+bool IsImpulseBar(int shift,bool is_up){
+   if (ATR_H1_avg<=0) return false;
+
+   double high  = iHigh (NULL,PERIOD_H1,shift);
+   double low   = iLow  (NULL,PERIOD_H1,shift);
+   double open  = iOpen (NULL,PERIOD_H1,shift);
+   double close = iClose(NULL,PERIOD_H1,shift);
+
+   double range = high - low;
+   if (range<=0.0) return false;
+   if (range < MinImpulseATR * ATR_H1_avg) return false;
+
+   double one_third = range/3.0;
+
+   if (is_up){
+      if (close<=open) return false;
+      if (!(close>= high - one_third))  return false;
+   }else{
+      if (close>=open) return false;
+      if (!(close<= low  + one_third))  return false;
+   }
+   return true;
+}
+//+------------------------------------------------------------------+
+//| Find latest pattern in current day (pending, line mode)          |
+//+------------------------------------------------------------------+
+void FindLatestPattern(){
+   if (CurrentTradeDir == NoTrade) return;
+   if (Level==0.0) return;
+
+   int max_bars = MathMin(SearchWindowBars, iBars(NULL,PERIOD_H1)-1);
+   if (max_bars < 1) return;
+
+   Pattern new_pattern = { -1, -1, 0.0, 0, 0, "" };
+   bool is_buy = (CurrentTradeDir==OnlyBuy);
+
+   // лог по геометрии для pending — только один раз до следующей валидной ситуации
+   static bool logShownPending = false;
+
+   for (int b_shift=1; b_shift<=max_bars; b_shift++){
+      datetime b_time = iTime(NULL,PERIOD_H1,b_shift);
+      if(!IsInSession(b_time) || !IsToday(b_time)) continue;
+
+      int max_a_search = (MaxGapBarsBetweenSignals==0)? max_bars : MathMin(b_shift+MaxGapBarsBetweenSignals,max_bars);
+      for (int a_shift=b_shift+1; a_shift<=max_a_search; a_shift++){
+         datetime a_time = iTime(NULL,PERIOD_H1,a_shift);
+         if(!IsInSession(a_time) || !IsToday(a_time)) continue;
+
+         bool a_impulse = IsImpulseBar(a_shift, !is_buy);
+         if (!a_impulse) continue;
+
+         double close_b = iClose(NULL,PERIOD_H1,b_shift);
+         double open_a  = iOpen (NULL,PERIOD_H1,a_shift);
+         bool ok = is_buy ? (close_b>open_a) : (close_b<open_a);
+         if (ok){
+            double refPrice = open_a;
+            if (!IsValidByLineGeometry(is_buy, refPrice)) {
+               if (!logShownPending && Debug){
+                  Print("[LINE][PENDING] Candidate rejected by line geometry");
+                  logShownPending = true;
+               }
+               continue;
+            }
+            // как только нашли валидную по геометрии ситуацию — разрешаем следующий лог при новом reject
+            logShownPending = false;
+
+            if (CurrentPattern.B_shift==-1 || b_shift<new_pattern.B_shift){
+               new_pattern.A_shift=a_shift;
+               new_pattern.B_shift=b_shift;
+               new_pattern.OpenA  =open_a;
+               new_pattern.A_time =a_time;
+               new_pattern.B_time =b_time;
+               new_pattern.Key    =ComposePatternKey(true,is_buy,new_pattern.A_time,new_pattern.B_time);
+            }
+            break;
+         }
+      }
+   }
+
+   if (new_pattern.B_shift!=-1){
+      if (IsKeyUsed(new_pattern.Key)){ 
+         if (Debug) Print("[LINE] Skip pending: used key ",new_pattern.Key); 
+         return; 
+      }
+
+      CurrentPattern = new_pattern;
+      double entry_preview=NormalizeDouble(new_pattern.OpenA,Digits);
+
+      double stop_level=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+      double freeze_lvl=MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point;
+      double min_dist=MathMax(stop_level,freeze_lvl);
+
+      if (CurrentTradeDir==OnlyBuy) entry_preview=MathMin(entry_preview,Ask - min_dist);
+      else                          entry_preview=MathMax(entry_preview,Bid + min_dist);
+
+      entry_preview = NormalizeDouble(entry_preview,Digits);
+      DrawPatternMarkers(CurrentPattern,entry_preview);
+      PlaceOrReplacePending();
+   }
+}
+//+------------------------------------------------------------------+
+//| Place or replace pending (line mode)                             |
+//+------------------------------------------------------------------+
+void PlaceOrReplacePending(){
+   if (CurrentPattern.A_shift==-1) return;
+   if (kOnePositionOnly && CountOpenPositions()>0){
+      if (Debug) Print("Skip pending: open position exists (OnePositionOnly).");
+      return;
+   }
+
+   if (IsKeyUsed(CurrentPattern.Key)){
+      if (Debug) Print("[LINE] Skip pending place: used key ",CurrentPattern.Key);
+      return;
+   }
+
+   double entry = NormalizeDouble(CurrentPattern.OpenA,Digits);
+   bool is_buy = (CurrentTradeDir==OnlyBuy);
+   int type    = is_buy ? OP_BUYLIMIT : OP_SELLLIMIT;
+
+   if (!IsDirectionAllowed(type)){
+      if (Debug) Print("Blocked pending by TradeDir");
+      return;
+   }
+
+   double stop_level = MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   double freeze_lvl = MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point;
+   double min_dist   = MathMax(stop_level,freeze_lvl);
+
+   if (is_buy){
+      entry = MathMin(entry,Ask - min_dist);
+      if (entry>Ask - min_dist){
+         if (Debug) Print("BuyLimit too close to Stop/Freeze level");
+         return;
+      }
+   }else{
+      entry = MathMax(entry,Bid + min_dist);
+      if (entry< Bid + min_dist){
+         if (Debug) Print("SellLimit too close to Stop/Freeze level");
+         return;
+      }
+   }
+   entry = NormalizeDouble(entry,Digits);
+
+   // ---- геометрия только по ЦЕНЕ ВХОДА ----
+   if (!IsValidByLineGeometry(is_buy, entry)){
+      if (Debug) Print("[LINE][AB-LIMIT] Rejected by line geometry");
+      return;
+   }
+
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   double tp_dist = TP_RR * sl_dist;
+   double sl = NormalizeDouble(is_buy ? entry - sl_dist : entry + sl_dist,Digits);
+   double tp = NormalizeDouble(is_buy ? entry + tp_dist : entry - tp_dist,Digits);
+
+   double min_stop=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   if (MathAbs(sl-entry)<min_stop){
+      sl = is_buy ? NormalizeDouble(entry-min_stop,Digits) : NormalizeDouble(entry+min_stop,Digits);
+      if (Debug) Print("SL adjusted to StopLevel.");
+   }
+   if (MathAbs(tp-entry)<min_stop){
+      tp = is_buy ? NormalizeDouble(entry+min_stop,Digits) : NormalizeDouble(entry-min_stop,Digits);
+      if (Debug) Print("TP adjusted to StopLevel.");
+   }
+
+   double lot = CalculateLot(entry,sl);
+   if (lot==0.0) return;
+
+   // ⛔ DAILY LOSS LIMIT — блокируем выставление pending в этот день
+   if(!CanTradeToday()){
+      Print("[DAILY-LOSS-LIMIT] Pending (line mode) blocked. losses=",
+            CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
+      return;
+   }
+
+   if (PendingTicket>0){
+      if (!kReplacePendingOnNewPattern) return;
+      if (!OrderSelect(PendingTicket,SELECT_BY_TICKET)){
+         PendingTicket=0;
+         PendingPatternKey = "";
+      }else{
+         double prev_entry=OrderOpenPrice();
+         bool better = (CurrentTradeDir==OnlyBuy && entry<=prev_entry-Point) ||
+                       (CurrentTradeDir==OnlySell && entry>=prev_entry+Point);
+         if (!better){
+            if (Debug) Print("[LINE] New pattern not better for replace.");
+            return;
+         }
+         if (!OrderDelete(PendingTicket)){
+            Print("[LINE] Error deleting pending: ",GetLastError());
+            return;
+         }
+         PendingTicket=0;
+         PendingPatternKey = "";
+      }
+   }
+
+      string cmt=StringFormat("TargetPoint(Line)|PK:%s",CurrentPattern.Key);
+   int ticket=OrderSend(Symbol(),type,lot,entry,kMaxSlippagePoints,sl,tp,cmt,MagicNumber,0,clrBlue);
+   if (ticket>0){
+      PendingTicket=ticket;
+      PendingPlaceTime=TimeCurrent();
+      PendingPlaceH1BarIndex=iBars(NULL,PERIOD_H1)-1;
+      PendingPatternKey = CurrentPattern.Key;
+      if (Debug) Print("AB-Limit [Line] Placed pending: ",(type==OP_BUYLIMIT?"BuyLimit":"SellLimit"),
+                       " at ",DoubleToStr(entry,Digits)," | ",PendingPatternKey);
+   }else{
+      Print("[LINE] Error placing pending: ",GetLastError());
+   }
+}
+//+------------------------------------------------------------------+
+//| Calculate lot size                                               |
+//+------------------------------------------------------------------+
+double ValuePerPoint_1lot(){
+   double tick_value=MarketInfo(Symbol(),MODE_TICKVALUE);
+   double tick_size =MarketInfo(Symbol(),MODE_TICKSIZE);
+   if (tick_size<=0.0) tick_size=Point;
+   return tick_value*(Point/tick_size);
+}
+double CalculateLot(double entry,double sl){
+   double balance=AccountBalance();
+   double risk_money=balance*RiskPercent/100.0;
+   double sl_dist=MathAbs(entry-sl);
+   double sl_points=sl_dist/Point;
+   if (sl_points<=0){ Print("Error: Invalid SL points."); return 0.0; }
+   double vpp=ValuePerPoint_1lot();
+   if (vpp<=0){ Print("Error: invalid ValuePerPoint"); return 0.0; }
+   double lot=risk_money/(sl_points*vpp);
+   double min_lot=MarketInfo(Symbol(),MODE_MINLOT);
+   double max_lot=MarketInfo(Symbol(),MODE_MAXLOT);
+   double lot_step=MarketInfo(Symbol(),MODE_LOTSTEP);
+   lot=MathFloor(lot/lot_step)*lot_step;
+   lot=MathMax(min_lot,MathMin(max_lot,lot));
+   if (lot<min_lot){
+      PrintFormat("Warning: computed lot %.4f < min %.2f, using MinLot.",lot,min_lot);
+      lot=min_lot;
+   }
+   return lot;
+}
+//+------------------------------------------------------------------+
+//| Manage pending (expiry = MaxGapBarsBetweenSignals)               |
+//+------------------------------------------------------------------+
+void ManagePending()
+{
+   if(PendingTicket <= 0) return;
+   if(CountOpenPositions() > 0) return;
+   
+   bool found = false;
+   for(int i=0; i<OrdersTotal(); i++)
+   {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES))
+      {
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MagicNumber && OrderTicket()==PendingTicket)
+         {
+            found = true;
+            break;
+         }
+      }
+   }
+   if(!found)
+   {
+      PendingTicket = 0;
+      return;
+   }
+
+   int barsSincePlace = iBarShift(NULL, PERIOD_H1, OrderOpenTime());
+      int expiryBars = MaxGapBarsBetweenSignals;
+   int currentH1Bars = iBars(NULL, PERIOD_H1);
+   int placeIndex = currentH1Bars - barsSincePlace - 1;
+
+   static datetime lastManageLog = 0;
+   if(lastManageLog == 0 || (PendingTicket != lastPendingManageTicket))
+   {
+      if(Debug) Print("[ManagePending] Ticket=",PendingTicket,", Bars since place=",barsSincePlace,
+                      ", Expiry bars=",expiryBars,", H1 bars=",currentH1Bars,", PlaceIndex=",placeIndex);
+      lastManageLog = TimeCurrent();
+      lastPendingManageTicket = PendingTicket;
+   }
+
+   if(barsSincePlace >= expiryBars)
+   {
+      if(OrderDelete(PendingTicket))
+      {
+         if(Debug) Print("[ManagePending] Expired pending order deleted. Ticket=",PendingTicket);
+         PendingTicket = 0;
+      }
+      else Print("[ManagePending] Delete error: ",GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage breakeven (standard)                                      |
+//+------------------------------------------------------------------+
+void ManageBreakeven_Standard(){
+   for (int i=OrdersTotal()-1;i>=0;i--){
+      if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if (OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      if (OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
+      int ticket=OrderTicket();
+      if (IsBEDone(ticket)) continue;
+      double entry=OrderOpenPrice();
+      double sl =OrderStopLoss();
+      double sl_dist = MathAbs(entry-sl);
+      double sl_points = sl_dist/Point;
+      double profitPoints = (OrderType()==OP_BUY ? (Bid-entry)/Point : (entry-Ask)/Point);
+      if (profitPoints >= sl_points * BreakevenSLMultiplier){
+         double newSL = NormalizeDouble(entry + (OrderType()==OP_BUY ? kBreakevenOffsetPoints*Point : -kBreakevenOffsetPoints*Point), Digits);
+         if ((OrderType()==OP_BUY && (sl==0 || newSL>sl)) || (OrderType()==OP_SELL && (sl==0 || newSL<sl))){
+            double tp=OrderTakeProfit();
+            if (OrderModify(ticket,entry,newSL,tp,0,clrGreen)){
+               Print("Breakeven set for ticket ",ticket);
+               AddBEDone(ticket);
+            }else{
+               Print("Error setting breakeven: ",GetLastError());
+            }
+         }
+      }
+   }
+}
+bool IsBEDone(int ticket){ for (int i=0;i<BE_DoneCount;i++){ if (BE_DoneTickets[i]==ticket) return true; } return false; }
+void AddBEDone(int ticket){ if (BE_DoneCount<ArraySize(BE_DoneTickets)){ BE_DoneTickets[BE_DoneCount]=ticket; BE_DoneCount++; } }
+bool WasJustActivated(int ticket,int seconds_grace=2){
+if(!OrderSelect(ticket,SELECT_BY_TICKET)) return false;
+return (TimeCurrent()-OrderOpenTime()<=seconds_grace);
+}
+bool CrossedUp(double level){ if(!g_prevInited) return false; return (g_prevBid<level && Bid>=level); }
+bool CrossedDown(double level){ if(!g_prevInited) return false; return (g_prevAsk>level && Ask<=level); }
+//+------------------------------------------------------------------+
+//| Impulse Dots Visualization |
+//+------------------------------------------------------------------+
+string GetBarId(int shift){
+datetime t = iTime(NULL, PERIOD_H1, shift);
+return IntegerToString(t);
+}
+void DrawAllImpulseDots(){
+ if(!ShowImpulseDots) return;
+
+   string prefix="ImpulseDot_";
+   for(int i=ObjectsTotal()-1; i>=0; i--){
+      string name = ObjectName(i);
+      if(StringFind(name, prefix) == 0) ObjectDelete(0, name);
+   }
+
+   int max_shift = MathMin(ImpulseScanBars, iBars(NULL, PERIOD_H1)-1);
+   for(int shift=1; shift<=max_shift; shift++){
+      datetime t = iTime(NULL, PERIOD_H1, shift);
+      string bar_id = GetBarId(shift);
+
+      if(IsImpulseBar(shift, true)){
+         double price = iLow(NULL, PERIOD_H1, shift) + (-ImpulseOffsetPoints) * Point;
+         string name = prefix + "bull_" + bar_id;
+         if(ObjectCreate(0, name, OBJ_TEXT, 0, t, price)){
+            ObjectSetText(name, CharToStr(ImpulseDotCode), 10, "Wingdings", kImpulseBullDotColor);
+            ObjectSetInteger(0, name, OBJPROP_BACK, false);
+         }
+      }
+
+      if(IsImpulseBar(shift, false)){
+         double price = iHigh(NULL, PERIOD_H1, shift) + (ImpulseOffsetPoints + 10) * Point;
+         string name = prefix + "bear_" + bar_id;
+         if(ObjectCreate(0, name, OBJ_TEXT, 0, t, price)){
+            ObjectSetText(name, CharToStr(ImpulseDotCode), 10, "Wingdings", kImpulseBearDotColor);
+            ObjectSetInteger(0, name, OBJPROP_BACK, false);
+         }
+      }
+   }
+
+   ChartRedraw();
+   
+}
+void DrawNewImpulseDot(int shift){
+if(!ShowImpulseDots) return;
+   if(shift != 1) return;
+
+   datetime t = iTime(NULL, PERIOD_H1, shift);
+   string bar_id = GetBarId(shift);
+   string prefix = "ImpulseDot_";
+
+   if(IsImpulseBar(shift, true)){
+      double price = iLow(NULL, PERIOD_H1, shift) + (-ImpulseOffsetPoints) * Point;
+      string name = prefix + "bull_" + bar_id;
+      if(ObjectFind(0, name) < 0){
+         if(ObjectCreate(0, name, OBJ_TEXT, 0, t, price)){
+            ObjectSetText(name, CharToStr(ImpulseDotCode), 10, "Wingdings", kImpulseBullDotColor);
+            ObjectSetInteger(0, name, OBJPROP_BACK, false);
+         }
+      }
+   }
+
+   if(IsImpulseBar(shift, false)){
+      double price = iHigh(NULL, PERIOD_H1, shift) + (ImpulseOffsetPoints + 10) * Point;
+      string name = prefix + "bear_" + bar_id;
+      if(ObjectFind(0, name) < 0){
+         if(ObjectCreate(0, name, OBJ_TEXT, 0, t, price)){
+            ObjectSetText(name, CharToStr(ImpulseDotCode), 10, "Wingdings", kImpulseBearDotColor);
+            ObjectSetInteger(0, name, OBJPROP_BACK, false);
+         }
+      }
+   }
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Vizualization                                                    |
+//+------------------------------------------------------------------+
+void DrawVLine(string name,datetime t,color c){
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   if(ObjectCreate(0, name, OBJ_VLINE, 0, t, 0)){
+      ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   }
+}
+
+void DrawArrow(string name,datetime t,double price,color c,int code){
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   if(ObjectCreate(0, name, OBJ_ARROW, 0, t, price)){
+      ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, code);
+   }
+}
+
+void DrawText(string name,datetime t,double price,string txt,color c){
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   if(ObjectCreate(0, name, OBJ_TEXT, 0, t, price)){
+      ObjectSetText(name, txt, 8, "Arial", c);
+   }
+}
+void DrawPatternMarkers(const Pattern &p,double entry){
+   string base=StringFormat("TP_%s_",Symbol());
+   DrawVLine(base+"A_v",p.A_time,clrDodgerBlue);
+   DrawVLine(base+"B_v",p.B_time,clrOrangeRed);
+   DrawArrow(base+"A_arrow",p.A_time,p.OpenA,clrDodgerBlue,241);
+   DrawText (base+"A_txt",  p.A_time,p.OpenA,"A (open)",clrDodgerBlue);
+   double closeB=iClose(NULL,PERIOD_H1,p.B_shift);
+   DrawArrow(base+"B_arrow",p.B_time,closeB,clrOrangeRed,241);
+   DrawText (base+"B_txt",  p.B_time,closeB,"B (close)",clrOrangeRed);
+
+   string el=base+"Entry";
+    if(ObjectFind(0, el) >= 0) ObjectDelete(0, el);
+   datetime t0=Time[0];
+   datetime t1=t0+Period()*60;
+   ObjectCreate(0,el,OBJ_TREND,0,t0,entry,t1,entry);
+   ObjectSetInteger(0,el,OBJPROP_RAY,true);
+   ObjectSetInteger(0,el,OBJPROP_STYLE,STYLE_DASHDOT);
+   ObjectSetInteger(0,el,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,el,OBJPROP_COLOR,clrLime);
+   ObjectSetString (0,el,OBJPROP_TEXT,"Entry");
+}
+
+void DrawSignalMarkers(const SignalCandle &s, bool isBuy){
+   string base=StringFormat("TP_Signal_%s_",Symbol());
+   color c = isBuy ? clrDodgerBlue : clrOrangeRed;
+   DrawVLine(base+"Signal_v",s.time,c);
+   DrawArrow(base+"Signal_arrow",s.time,s.entry_level,c,241);
+   DrawText (base+"Signal_txt", s.time,s.entry_level,"Signal Entry",c);
+
+   string el=base+"Entry";
+   if (ObjectFind(el)>=0) ObjectDelete(el);
+   datetime t0=Time[0];
+   datetime t1=t0+Period()*60;
+   ObjectCreate(0,el,OBJ_TREND,0,t0,s.entry_level,t1,s.entry_level);
+   ObjectSetInteger(0,el,OBJPROP_RAY,true);
+   ObjectSetInteger(0,el,OBJPROP_STYLE,STYLE_DASHDOT);
+   ObjectSetInteger(0,el,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,el,OBJPROP_COLOR,clrLime);
+   ObjectSetString (0,el,OBJPROP_TEXT,"Signal Entry");
+}
+
+double PipSize(){ return (Digits==5 || Digits==3) ? 10.0*Point : Point; }
+int ToPips(double price_distance){ double pip=PipSize(); return (int)MathRound(price_distance/pip); }
+
+void DrawLabel(string name,int corner,int x,int y,string text,int fontsize,color c){
+if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontsize);
+   ObjectSetText(name, text, fontsize, "Arial", c);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);   
+}
+
+void DrawHUD(){
+   string dir=(CurrentTradeDir==OnlyBuy)?"BUY":(CurrentTradeDir==OnlySell)?"SELL":"NO TRADE";
+   string beMode = (CurrentBreakevenMode == BE_Standard) ? "Standard" : "ByDashedHLine";
+   int fs=12;
+   int chart_w=(int)ChartGetInteger(0,CHART_WIDTH_IN_PIXELS,0);
+   string dirTx=StringFormat("Direction: %s | BE: %s",dir,beMode);
+   int approx_w=(int)(StringLen(dirTx)*(fs*0.6));
+   int x_center=MathMax(0,chart_w/2 - approx_w/2);
+   DrawLabel("TP_HUD_DIR",0,x_center,10,dirTx,fs+2,clrBlack);
+
+   int atr_h1_pips=ToPips(ATR_H1_avg);
+   int atr_d1_pips=ToPips(ATR_D1_avg);
+   string l_atr=StringFormat("ATR(D1) %d pp    ATR(H1) %d pp",atr_d1_pips,atr_h1_pips);
+   DrawLabel("TP_HUD_ATR",2,10,10,l_atr,fs,clrBlack);
+
+   ObjectDelete(0, "TP_HUD_2"); ObjectDelete(0, "TP_HUD_3"); ObjectDelete(0, "TP_HUD_BL");
+   ObjectDelete(0, "TP_HUD_1"); ObjectDelete(0, "TP_HUD_4"); ObjectDelete(0, "TP_HUD_5"); ObjectDelete(0, "TP_HUD_6");
+   ChartRedraw();
+}
+void DrawHUD_NoLine(){
+   string dir=(CurrentTradeDir==OnlyBuy)?"BUY":(CurrentTradeDir==OnlySell)?"SELL":"NO TRADE";
+   string beMode = (CurrentBreakevenMode == BE_Standard) ? "Standard" : "ByDashedHLine";
+   int fs=12;
+   int chart_w=(int)ChartGetInteger(0,CHART_WIDTH_IN_PIXELS,0);
+   string dirTx=StringFormat("Direction: %s  (NoLine) | BE: %s",dir,beMode);
+   int approx_w=(int)(StringLen(dirTx)*(fs*0.6));
+   int x_center=MathMax(0,chart_w/2 - approx_w/2);
+   DrawLabel("TP_HUD_DIR",0,x_center,10,dirTx,fs+2,clrBlack);
+
+   int atr_h1_pips=ToPips(ATR_H1_avg);
+   int atr_d1_pips=ToPips(ATR_D1_avg);
+   string l_atr=StringFormat("ATR(D1) %d pp    ATR(H1) %d pp",atr_d1_pips,atr_h1_pips);
+   DrawLabel("TP_HUD_ATR",2,10,10,l_atr,fs,clrBlack);
+
+   ObjectDelete(0, "DBG_2"); ObjectDelete(0, "DBG_3");
+   ChartRedraw();
+}
+
+// ==================================================================
+// ============== DAILY EXTREME BREAK (FIXED LOGIC) ==================
+// ==================================================================
+
+datetime GetBrokerDayStart(){ return iTime(NULL, PERIOD_D1, 0); }
+bool IsWithinBrokerDay(datetime t, datetime dayStart){ return (t >= dayStart && t < dayStart + 86400); }
+
+//+------------------------------------------------------------------+
+//| DailyExtremeBreak logic for NoLine mode                          |
+//+------------------------------------------------------------------+
+void UpdateAndCheckDailyExtreme_NoLine() {
+   bool lineMode = false;
+   UpdateAndCheckDailyExtreme(lineMode);
+}
+
+//+------------------------------------------------------------------+
+//| DailyExtremeBreak logic for Line mode                            |
+//+------------------------------------------------------------------+
+void UpdateAndCheckDailyExtreme_Line() {
+   bool lineMode = true;
+   UpdateAndCheckDailyExtreme(lineMode);
+}
+
+void UpdateAndCheckDailyExtreme(bool lineMode) {
+if (CurrentTradeDir == NoTrade) return;
+static datetime s_lastCheckedH1 = 0;
+datetime h1_closed_time = iTime(NULL, PERIOD_H1, 1);
+if (h1_closed_time == 0) return;
+if (h1_closed_time == s_lastCheckedH1) return;
+s_lastCheckedH1 = h1_closed_time;
+if (!IsInSession(TimeCurrent())) return;
+datetime dayStart = GetBrokerDayStart();
+double dayHighD1 = iHigh(NULL, PERIOD_D1, 0);
+double dayLowD1  = iLow (NULL, PERIOD_D1, 0);
+int max_bars = iBars(NULL, PERIOD_H1) - 1;
+int hi_shift = -1, lo_shift = -1;
+datetime hi_time = 0, lo_time = 0;
+double hi_bar_low = 0.0, lo_bar_high = 0.0;
+for (int shift = max_bars; shift >= 1; shift--) {
+datetime t = iTime(NULL, PERIOD_H1, shift);
+if (!IsWithinBrokerDay(t, dayStart)) continue;
+double h = iHigh(NULL, PERIOD_H1, shift);
+double l = iLow (NULL, PERIOD_H1, shift);
+if (hi_shift == -1 && AlmostEqual(h, dayHighD1)) { hi_shift = shift; hi_time = t; hi_bar_low = l; }
+if (lo_shift == -1 && AlmostEqual(l, dayLowD1))  { lo_shift = shift; lo_time = t; lo_bar_high = h; }
+if (hi_shift != -1 && lo_shift != -1) break;
+}
+bool high_in_window = (hi_shift != -1 && IsInSession(hi_time));
+bool low_in_window  = (lo_shift != -1 && IsInSession(lo_time));
+static datetime lastD1Log = 0;
+datetime today = TimeCurrent() / 86400 * 86400;
+if(Debug && lastD1Log < today)
+{
+PrintFormat("[DEB][D1] dayStart=%s High=%.5f (t=%s, inWin=%s) Low=%.5f (t=%s, inWin=%s)",
+TimeToString(dayStart, TIME_DATE|TIME_MINUTES),
+dayHighD1, TimeToString(hi_time, TIME_DATE|TIME_MINUTES), high_in_window?"Y":"N",
+dayLowD1, TimeToString(lo_time, TIME_DATE|TIME_MINUTES), low_in_window ?"Y":"N");
+lastD1Log = today;
+}
+if (CurrentTradeDir == OnlySell){
+if (!high_in_window){
+if (Debug) Print("[DEB][SELL] Blocked: D1 High formed outside session. Waiting for new in-window High.");
+}else{
+double prev_close = iClose(NULL, PERIOD_H1, 1);
+if (prev_close < hi_bar_low){
+SignalCandle s;
+s.shift = hi_shift;
+s.time = h1_closed_time;
+s.extreme = dayHighD1;
+s.entry_level = hi_bar_low;
+s.Key = ComposePatternKey(lineMode, false, hi_time, 0);
+if (!IsKeyUsed(s.Key)){
+if (Debug) PrintFormat("[DEB][SELL] VALID (H1 close). D1.High=%.5f | Entry=%.5f | PrevClose=%.5f",
+dayHighD1, s.entry_level, prev_close);
+DrawSignalMarkers(s, false);
+PlacePendingDailyExtreme(s, false, lineMode);
+}
+}else if (Debug){
+PrintFormat("[DEB][SELL] Rejected: PrevClose(%.5f) >= BarLow(%.5f).", prev_close, hi_bar_low);
+}
+}
+}
+if (CurrentTradeDir == OnlyBuy){
+if (!low_in_window){
+if (Debug) Print("[DEB][BUY] Blocked: D1 Low formed outside session. Waiting for new in-window Low.");
+}else{
+double prev_close = iClose(NULL, PERIOD_H1, 1);
+if (prev_close > lo_bar_high){
+SignalCandle s;
+s.shift = lo_shift;
+s.time = h1_closed_time;
+s.extreme = dayLowD1;
+s.entry_level = lo_bar_high;
+s.Key = ComposePatternKey(lineMode, true, lo_time, 0);
+if (!IsKeyUsed(s.Key)){
+if (Debug) PrintFormat("[DEB][BUY] VALID (H1 close). D1.Low=%.5f | Entry=%.5f | PrevClose=%.5f",
+dayLowD1, s.entry_level, prev_close);
+DrawSignalMarkers(s, true);
+PlacePendingDailyExtreme(s, true, lineMode);
+}
+}else if (Debug){
+PrintFormat("[DEB][BUY] Rejected: PrevClose(%.5f) <= BarHigh(%.5f).", prev_close, lo_bar_high);
+}
+}
+}
+if (CurrentTradeDir == OnlySell && hi_shift == -1 && Debug)
+Print("[DEB][SELL] No H1 bar matched D1 High (full-day scan).");
+if (CurrentTradeDir == OnlyBuy && lo_shift == -1 && Debug)
+Print("[DEB][BUY] No H1 bar matched D1 Low (full-day scan).");
+}
+
+//+------------------------------------------------------------------+
+//| Place pending for DailyExtremeBreak                              |
+//+------------------------------------------------------------------+
+void PlacePendingDailyExtreme(const SignalCandle &s, bool isBuy, bool lineMode) {
+   if (kOnePositionOnly && CountOpenPositions() > 0) return;
+
+   if (IsKeyUsed(s.Key)) {
+      if (Debug) Print("[DailyExtremeBreak] Skip pending: used key ", s.Key);
+      return;
+   }
+
+   double entry = NormalizeDouble(s.entry_level, Digits);
+   int type = isBuy ? OP_BUYLIMIT : OP_SELLLIMIT;
+   if (!IsDirectionAllowed(type)) return;
+
+   double stop_level = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+   double freeze_lvl = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+   double min_dist = MathMax(stop_level, freeze_lvl);
+
+   if (isBuy) {
+      entry = MathMin(entry, Ask - min_dist);
+      if (entry > Ask - min_dist) return;
+   } else {
+      entry = MathMax(entry, Bid + min_dist);
+      if (entry < Bid + min_dist) return;
+   }
+   entry = NormalizeDouble(entry, Digits);
+
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   double sl, tp;
+   if (UseExtremeSL) {
+      sl = isBuy ? NormalizeDouble(s.extreme - Point, Digits) : NormalizeDouble(s.extreme + Point, Digits);
+      double dist = MathAbs(entry - sl);
+      if (dist > 0.3 * ATR_D1_avg) {
+         sl_dist = 0.3 * ATR_D1_avg;
+         sl = NormalizeDouble(isBuy ? entry - sl_dist : entry + sl_dist, Digits);
+         if (Debug) PrintFormat("[DailyExtremeBreak] SL adjusted to 0.3*ATR_D1_avg (%.5f)", sl);
+      } else if (Debug) {
+         PrintFormat("[DailyExtremeBreak] SL set beyond extreme (%.5f)", sl);
+      }
+   } else {
+      sl = NormalizeDouble(isBuy ? entry - sl_dist : entry + sl_dist, Digits);
+   }
+
+   double tp_dist = TP_RR * sl_dist;
+   tp = NormalizeDouble(isBuy ? entry + tp_dist : entry - tp_dist, Digits);
+
+   double min_stop = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+   if (MathAbs(sl - entry) < min_stop) {
+      sl = isBuy ? NormalizeDouble(entry - min_stop, Digits) : NormalizeDouble(entry + min_stop, Digits);
+   }
+   if (MathAbs(tp - entry) < min_stop) {
+      tp = isBuy ? NormalizeDouble(entry + min_stop, Digits) : NormalizeDouble(entry - min_stop, Digits);
+   }
+
+   double lot = CalculateLot(entry, sl);
+   if (lot == 0.0) return;
+
+// ⛔ DAILY LOSS LIMIT — блокируем выставление pending в этот день
+if(!CanTradeToday())
+{
+   Print("[DAILY-LOSS-LIMIT] Pending (line mode) blocked. losses=",
+         CountLosingTradesToday(), " limit=", MaxLosingTradesPerDay);
+   return;
+}
+
+   if (PendingTicket > 0) {
+      if (!kReplacePendingOnNewPattern) return;
+      if (!OrderSelect(PendingTicket, SELECT_BY_TICKET)) {
+         PendingTicket = 0;
+         PendingPatternKey = "";
+         return;
+      }
+      double prev_entry = OrderOpenPrice();
+      bool better = (isBuy && entry <= prev_entry - Point) || (!isBuy && entry >= prev_entry + Point);
+      if (!better) return;
+      if (!OrderDelete(PendingTicket)) return;
+      PendingTicket = 0;
+      PendingPatternKey = "";
+   }
+
+   string mode_str = lineMode ? "Line" : "NoLine";
+   string cmt = StringFormat("DailyExtremeBreak(%s)|PK:%s", mode_str, s.Key);
+   color clr = isBuy ? clrGreen : clrRed;
+   int ticket = OrderSend(Symbol(), type, lot, entry, kMaxSlippagePoints, sl, tp, cmt, MagicNumber, 0, clr);
+   if (ticket > 0) {
+      PendingTicket = ticket;
+      PendingPlaceTime = TimeCurrent();
+      PendingPlaceH1BarIndex = iBars(NULL, PERIOD_H1) - 1;
+      PendingPatternKey = s.Key;
+      if (Debug) Print("[DailyExtremeBreak] Placed pending: ", (type == OP_BUYLIMIT ? "BuyLimit" : "SellLimit"), " at ", DoubleToStr(entry, Digits), " | ", s.Key);
+   } else {
+      Print("[DailyExtremeBreak] Error placing pending: ", GetLastError());
+   }
+}
+//+------------------------------------------------------------------+
