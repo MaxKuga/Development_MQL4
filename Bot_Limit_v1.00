@@ -1,0 +1,1159 @@
+//+------------------------------------------------------------------+
+//|                                                     Bot_Limit    |
+//+------------------------------------------------------------------+
+#property strict
+
+enum TradeDirectionEnum  { NoTrade = 0, OnlyBuy = 1, OnlySell = 2 };
+enum BreakevenModeEnum   { BE_Standard = 0, BE_ByDashedHLine = 1 };
+
+//====================== INPUTS =====================================
+input TradeDirectionEnum InputTradeDir       = NoTrade;
+input double      RiskPercent                = 1.0;
+input double      SL_Percent                 = 0.25;
+input double      TP_RR                      = 5.0;
+input double      BreakevenSLMultiplier      = 2.0;
+extern int        BreakevenOffsetPoints      = 10;
+input int         MaxLosingTradesPerDay      = 1;
+input int         D1_AvgRangePeriod          = 20;
+input int         MagicNumber                = 20250930;
+input int         StartHour                  = 6;
+input int         StartMinute                = 0;
+input int         EndHour                    = 22;
+input int         EndMinute                  = 0;
+
+//====================== КОНСТАНТЫ ==================================
+const int    kMaxSlippagePoints            = 20;
+const bool   kOnePositionOnly              = true;
+
+// кнопки
+const string kBuyButtonName      = "TP_BUY_BTN";
+const string kSellButtonName     = "TP_SELL_BTN";
+const string kOffButtonName      = "TP_OFF_BTN";
+const string kBEButtonName       = "TP_BE_BTN";
+const string kLimitButtonName    = "TP_LIMIT_BTN";
+const string kTPButtonName       = "TP_TP_BTN";
+const string kCloseAllButtonName = "TP_CLOSEALL_BTN";
+const color  kButtonTextColor    = clrBlack;
+const color  kInactiveBGColor    = clrWhite;
+const color  kBuyActiveBGColor   = clrLime;
+const color  kSellActiveBGColor  = clrRed;
+const color  kOffActiveBGColor   = clrGray;
+const color  kBEButtonBGColor    = clrYellow;
+const color  kLimitButtonBGColor = clrAqua;
+const color  kTPButtonBGColor    = clrRed;
+const color  kCloseAllButtonBGColor = clrPink;
+
+// линии
+string   LimitLineName = "TP_LIMIT_LINE";
+const string kTPOverrideLineName = "TP_OVERRIDE_LINE";
+
+//====================== ГЛОБАЛЬНЫЕ =================================
+int CurrentTradeDir = NoTrade;
+BreakevenModeEnum CurrentBreakevenMode = BE_Standard;
+
+double   LimitLevel = 0.0;
+bool     LimitActive = false;
+
+double   TPOverrideLevel = 0.0;
+bool     TPOverrideActive = false;
+bool     TPOverridePendingRestore = false;
+
+ulong    g_tpLineCreatedLogTick   = 0;
+ulong    g_tpLineRemovedLogTick   = 0;
+ulong    g_tpOverrideAppliedLogTick = 0;
+ulong    g_tpRestoredLogTick      = 0;
+
+double   ATR_D1_avg = 0.0;
+
+double   g_prevBid = 0.0;
+double   g_prevAsk = 0.0;
+bool     g_prevInited = false;
+
+int      BE_DoneTickets[100];
+int      BE_DoneCount = 0;
+
+//====================== DAY HELPERS/DAILY LOSS =====================
+datetime DayStartServer()
+{
+   return iTime(Symbol(), PERIOD_D1, 0);
+}
+
+int CountLosingTradesToday()
+{
+   const double EPS = 1e-8;
+   datetime dayStart = DayStartServer();
+   int losses = 0;
+
+   int total = OrdersHistoryTotal();
+   for(int i=0; i<total; i++)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderSymbol() != _Symbol)                  continue;
+      if(OrderMagicNumber() != MagicNumber)         continue;
+
+      int t = OrderType();
+      if(t!=OP_BUY && t!=OP_SELL)                   continue;
+      datetime ct = OrderCloseTime();
+      if(ct < dayStart)                             continue;
+
+      double pnl = OrderProfit() + OrderSwap() + OrderCommission();
+      if(pnl < -EPS) losses++;
+   }
+   return losses;
+}
+
+bool CanTradeToday()
+{
+   if(MaxLosingTradesPerDay <= 0) return true;
+   return (CountLosingTradesToday() < MaxLosingTradesPerDay);
+}
+
+void CancelAllPendings()
+{
+   for(int i=OrdersTotal()-1; i>=0; i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUYLIMIT || t==OP_SELLLIMIT || t==OP_BUYSTOP || t==OP_SELLSTOP)
+      {
+         int tk = OrderTicket();
+         OrderDelete(tk);
+      }
+   }
+}
+
+void EnforceDailyLossLimit()
+{
+   static datetime lastDay = 0;
+   static bool blocked = false;
+
+   datetime today = DayStartServer();
+   if(today != lastDay)
+   {
+      lastDay = today;
+      blocked = false;
+   }
+
+   if(MaxLosingTradesPerDay > 0 && CountLosingTradesToday() >= MaxLosingTradesPerDay)
+   {
+      if(!blocked)
+      {
+         Print("[DAILY-LOSS-LIMIT] Trading blocked for today. losses=",
+               CountLosingTradesToday()," limit=",MaxLosingTradesPerDay,
+               " dayStart=",TimeToString(today));
+         blocked = true;
+      }
+      CancelAllPendings();
+   }
+}
+
+void CloseAll()
+{
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUY)
+      {
+         OrderClose(OrderTicket(),OrderLots(),Bid,kMaxSlippagePoints,clrRed);
+      }
+      else if(t==OP_SELL)
+      {
+         OrderClose(OrderTicket(),OrderLots(),Ask,kMaxSlippagePoints,clrRed);
+      }
+   }
+   CancelAllPendings();
+}
+
+//====================== DIRECTION ==================================
+int CountOpenPositions()
+{
+   int c=0;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol()) continue;
+      if(OrderMagicNumber()!=MagicNumber) continue;
+      int t=OrderType();
+      if(t==OP_BUY || t==OP_SELL) c++;
+   }
+   return c;
+}
+
+bool IsDirectionAllowed(int type)
+{
+   if(CurrentTradeDir==OnlyBuy  && (type==OP_SELL || type==OP_SELLLIMIT || type==OP_SELLSTOP))  return false;
+   if(CurrentTradeDir==OnlySell && (type==OP_BUY  || type==OP_BUYLIMIT || type==OP_BUYSTOP ))  return false;
+   return (CurrentTradeDir!=NoTrade);
+}
+
+void CreateDirectionButtons()
+{
+   int btn_width=60, btn_height=25, y_pos=30, x_start=10;
+
+   if (ObjectFind(0,kBuyButtonName)<0) ObjectCreate(0,kBuyButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_XDISTANCE,x_start);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kBuyButtonName,OBJPROP_TEXT,"BUY");
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlyBuy? kBuyActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kSellButtonName)<0) ObjectCreate(0,kSellButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_XDISTANCE,x_start+btn_width+5);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kSellButtonName,OBJPROP_TEXT,"SELL");
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlySell? kSellActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kOffButtonName)<0) ObjectCreate(0,kOffButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_XDISTANCE,x_start+2*(btn_width+5));
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kOffButtonName,OBJPROP_TEXT,"OFF");
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==NoTrade? kOffActiveBGColor:kInactiveBGColor));
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kBEButtonName)<0) ObjectCreate(0,kBEButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_XDISTANCE,x_start+3*(btn_width+5));
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kBEButtonName,OBJPROP_TEXT,"BE");
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_BGCOLOR,kBEButtonBGColor);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kLimitButtonName)<0) ObjectCreate(0,kLimitButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_XDISTANCE,x_start+4*(btn_width+5));
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kLimitButtonName,OBJPROP_TEXT,"Limit");
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_BGCOLOR,kLimitButtonBGColor);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kTPButtonName)<0) ObjectCreate(0,kTPButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_XDISTANCE,x_start+5*(btn_width+5));
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kTPButtonName,OBJPROP_TEXT,"TP");
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_BGCOLOR,kTPButtonBGColor);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+
+   if (ObjectFind(0,kCloseAllButtonName)<0) ObjectCreate(0,kCloseAllButtonName,OBJ_BUTTON,0,0,0);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_XDISTANCE,x_start+6*(btn_width+5));
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_YDISTANCE,y_pos);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_XSIZE,btn_width);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_YSIZE,btn_height);
+   ObjectSetString (0,kCloseAllButtonName,OBJPROP_TEXT,"CloseAll");
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_COLOR,kButtonTextColor);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_BGCOLOR,kCloseAllButtonBGColor);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_BORDER_COLOR,clrBlack);
+   ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+
+   ChartRedraw();
+}
+
+void UpdateButtonColors()
+{
+   ObjectSetInteger(0,kBuyButtonName, OBJPROP_BGCOLOR,(CurrentTradeDir==OnlyBuy ? kBuyActiveBGColor : kInactiveBGColor));
+   ObjectSetInteger(0,kSellButtonName,OBJPROP_BGCOLOR,(CurrentTradeDir==OnlySell? kSellActiveBGColor: kInactiveBGColor));
+   ObjectSetInteger(0,kOffButtonName, OBJPROP_BGCOLOR,(CurrentTradeDir==NoTrade ? kOffActiveBGColor  : kInactiveBGColor));
+   ChartRedraw();
+}
+
+void CheckButtonStates()
+{
+   if (ObjectGetInteger(0,kBuyButtonName,OBJPROP_STATE))
+   {
+      CurrentTradeDir=OnlyBuy;
+      ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+   }
+   if (ObjectGetInteger(0,kSellButtonName,OBJPROP_STATE))
+   {
+      CurrentTradeDir=OnlySell;
+      ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+   }
+   if (ObjectGetInteger(0,kOffButtonName,OBJPROP_STATE))
+   {
+      CurrentTradeDir=NoTrade;
+      ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false);
+      UpdateButtonColors();
+   }
+
+   if (ObjectGetInteger(0,kBEButtonName,OBJPROP_STATE))
+   {
+      ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+      double pip = ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+      double offset = 30.0 * pip;
+      double price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+      string beLineName = "TP_BE_LINE";
+      if(ObjectFind(0,beLineName) >= 0) ObjectDelete(0, beLineName);
+      ObjectCreate(0,beLineName, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0,beLineName, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0,beLineName, OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0,beLineName, OBJPROP_WIDTH, 1);
+      ChartRedraw();
+   }
+   if (ObjectGetInteger(0,kLimitButtonName,OBJPROP_STATE))
+   {
+      ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+      double pip = ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+      double offset = 40.0 * pip;
+      double price;
+      if(CurrentTradeDir == OnlyBuy)      price = NormalizeDouble(Ask + offset, Digits);
+      else if(CurrentTradeDir == OnlySell)price = NormalizeDouble(Bid - offset, Digits);
+      else                                price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+      if(ObjectFind(0,LimitLineName) >= 0) ObjectDelete(0, LimitLineName);
+      ObjectCreate(0, LimitLineName, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, LimitLineName, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, LimitLineName, OBJPROP_COLOR, clrBlue);
+      ObjectSetInteger(0, LimitLineName, OBJPROP_WIDTH, 1);
+      ChartRedraw();
+   }
+   if (ObjectGetInteger(0,kTPButtonName,OBJPROP_STATE))
+   {
+      ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+      if(ObjectFind(0,kTPOverrideLineName) >= 0)
+      {
+         bool hadLine = (ObjectFind(0,kTPOverrideLineName) >= 0);
+         if(hadLine)
+         {
+            if(!ObjectDelete(0, kTPOverrideLineName))
+               Print("Failed to delete TP override line. err=", GetLastError());
+            else
+               ChartRedraw();
+         }
+         if(TPOverrideActive || hadLine)
+         {
+            TPOverrideActive = false;
+            TPOverrideLevel = 0.0;
+            TPOverridePendingRestore = true;
+            ulong now = GetTickCount();
+            if(now != g_tpLineRemovedLogTick)
+            {
+               g_tpLineRemovedLogTick = now;
+               Print("TP LINE REMOVED");
+            }
+         }
+      }
+      else
+      {
+         int dir;
+         bool hasBuy=false, hasSell=false;
+         for(int i=OrdersTotal()-1;i>=0;i--)
+         {
+            if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+            if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+            int t=OrderType();
+            if(t==OP_BUY) hasBuy=true;
+            if(t==OP_SELL) hasSell=true;
+         }
+         TradeDirectionEnum d;
+         if(CurrentTradeDir==OnlyBuy || CurrentTradeDir==OnlySell)
+            d = (TradeDirectionEnum)CurrentTradeDir;
+         else if(hasBuy && !hasSell) d = OnlyBuy;
+         else if(hasSell && !hasBuy) d = OnlySell;
+         else d = OnlyBuy;
+
+         double dist = SL_Percent * ATR_D1_avg;
+         if(dist <= 0.0)
+         {
+            dist = 40.0 * ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+         }
+         double price = 0.0;
+         if(d==OnlySell) price = Bid - dist;
+         else            price = Ask + dist;
+         price = NormalizeDouble(price,Digits);
+
+         if(price > 0.0)
+         {
+            if(!ObjectCreate(0, kTPOverrideLineName, OBJ_HLINE, 0, 0, price))
+            {
+               Print("Failed to create TP override line. err=", GetLastError());
+            }
+            else
+            {
+               ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_STYLE, STYLE_DASH);
+               ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_COLOR, clrRed);
+               ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_WIDTH, 1);
+               TPOverrideLevel = price;
+               TPOverrideActive = true;
+               TPOverridePendingRestore = false;
+               ChartRedraw();
+               ulong now2 = GetTickCount();
+               if(now2 != g_tpLineCreatedLogTick)
+               {
+                  g_tpLineCreatedLogTick = now2;
+                  Print("TP LINE CREATED, price=", DoubleToStr(price,Digits));
+               }
+            }
+         }
+      }
+   }
+
+   if (ObjectGetInteger(0,kCloseAllButtonName,OBJPROP_STATE))
+   {
+      ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+      CloseAll();
+   }
+}
+
+//====================== SESSION ====================================
+bool IsInSession(datetime t)
+{
+   int h = TimeHour(t);
+   int m = TimeMinute(t);
+   int start = StartHour*60 + StartMinute;
+   int end   = EndHour*60 + EndMinute;
+   int cur   = h*60 + m;
+
+   if(start==end) return true;
+   if(start < end) return (cur >= start && cur < end);
+   return (cur >= start || cur < end);
+}
+
+//====================== LIMIT LINE / PENDING =======================
+void UpdateLimitLine()
+{
+   if(ObjectFind(0,LimitLineName) < 0)
+   {
+      LimitActive = false;
+      LimitLevel = 0.0;
+      return;
+   }
+   LimitLevel = NormalizeDouble(ObjectGetDouble(0,LimitLineName,OBJPROP_PRICE,0), Digits);
+   LimitActive = true;
+}
+
+int FindLimitPending(int &typeOut)
+{
+   for(int i=OrdersTotal()-1; i>=0; i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      int t = OrderType();
+      if(t==OP_BUYLIMIT || t==OP_SELLLIMIT)
+      {
+         typeOut = t;
+         return OrderTicket();
+      }
+   }
+   typeOut = -1;
+   return -1;
+}
+
+//====================== TP OVERRIDE ================================
+void UpdateTPOverrideLineState()
+{
+   if(ObjectFind(0,kTPOverrideLineName) < 0)
+   {
+      if(TPOverrideActive)
+      {
+         TPOverrideActive = false;
+         TPOverrideLevel = 0.0;
+         TPOverridePendingRestore = true;
+         ulong now = GetTickCount();
+         if(now != g_tpLineRemovedLogTick)
+         {
+            g_tpLineRemovedLogTick = now;
+            Print("TP LINE REMOVED");
+         }
+      }
+      return;
+   }
+
+   double price = NormalizeDouble(ObjectGetDouble(0, kTPOverrideLineName, OBJPROP_PRICE, 0), Digits);
+   TPOverrideLevel = price;
+   if(!TPOverrideActive)
+   {
+      TPOverrideActive = true;
+      TPOverridePendingRestore = false;
+   }
+}
+
+void ApplyTPOverride()
+{
+   if(!TPOverrideActive) return;
+   double target = TPOverrideLevel;
+   if(target <= 0.0) return;
+
+   bool modified = false;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      int type = OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      double entry = OrderOpenPrice();
+      double sl    = OrderStopLoss();
+      double newTP = NormalizeDouble(target, Digits);
+      double currentTP = OrderTakeProfit();
+      double tol = Point/2.0;
+
+      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
+      if(type==OP_BUY  && newTP <= entry) continue;
+      if(type==OP_SELL && newTP >= entry) continue;
+
+      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE))
+      {
+         modified = true;
+      }
+      else
+      {
+         Print("Failed to apply TP override for ticket ", OrderTicket(), " err=", GetLastError());
+      }
+   }
+
+   if(modified)
+   {
+      ulong now = GetTickCount();
+      if(now != g_tpOverrideAppliedLogTick)
+      {
+         g_tpOverrideAppliedLogTick = now;
+         Print("TP OVERRIDE APPLIED");
+      }
+   }
+}
+
+void RestoreTPToRR()
+{
+   bool modified = false;
+   bool attempted = false;
+   bool failed = false;
+
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      int type = OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      double entry = OrderOpenPrice();
+      double sl    = OrderStopLoss();
+      if(sl <= 0.0) continue;
+
+      double dist = MathAbs(entry - sl);
+      if(dist <= Point/2.0) continue;
+
+      double newTP = (type==OP_BUY) ? (entry + TP_RR * dist) : (entry - TP_RR * dist);
+      newTP = NormalizeDouble(newTP, Digits);
+
+      double currentTP = OrderTakeProfit();
+      double tol = Point/2.0;
+      if(currentTP>0.0 && MathAbs(currentTP - newTP) <= tol) continue;
+
+      attempted = true;
+      if(OrderModify(OrderTicket(), entry, sl, newTP, 0, clrNONE))
+      {
+         modified = true;
+      }
+      else
+      {
+         failed = true;
+         Print("Failed to restore TP for ticket ", OrderTicket(), " err=", GetLastError());
+      }
+   }
+
+   if(modified)
+   {
+      ulong now = GetTickCount();
+      if(now != g_tpRestoredLogTick)
+      {
+         g_tpRestoredLogTick = now;
+         Print("TP RESTORED TO RR MODE");
+      }
+   }
+
+   if(!attempted || !failed)
+      TPOverridePendingRestore = false;
+}
+
+void HandleTPOverrideOnTick()
+{
+   if(TPOverrideActive)
+      ApplyTPOverride();
+   else if(TPOverridePendingRestore)
+      RestoreTPToRR();
+}
+
+//====================== BREAKEVEN / DASHED LINE ====================
+bool IsBEDone(int ticket)
+{
+   for (int i=0;i<BE_DoneCount;i++)
+   {
+      if (BE_DoneTickets[i]==ticket) return true;
+   }
+   return false;
+}
+
+void AddBEDone(int ticket)
+{
+   if (BE_DoneCount<ArraySize(BE_DoneTickets))
+   {
+      BE_DoneTickets[BE_DoneCount]=ticket;
+      BE_DoneCount++;
+   }
+}
+
+bool WasJustActivated(int ticket,int seconds_grace=2)
+{
+   if(!OrderSelect(ticket,SELECT_BY_TICKET)) return false;
+   return (TimeCurrent()-OrderOpenTime()<=seconds_grace);
+}
+
+bool CrossedUp(double level)
+{
+   if(!g_prevInited) return false;
+   return (g_prevBid<level && Bid>=level);
+}
+
+bool CrossedDown(double level)
+{
+   if(!g_prevInited) return false;
+   return (g_prevAsk>level && Ask<=level);
+}
+
+bool HasDashedLine()
+{
+   int total=ObjectsTotal();
+   for(int i=0;i<total;i++)
+   {
+      string name=ObjectName(i);
+      if(ObjectType(name)!=OBJ_HLINE) continue;
+      if(name==LimitLineName) continue;
+      if(name==kTPOverrideLineName) continue;
+      int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+      if(style==STYLE_DASH || style==STYLE_DASHDOT || style==STYLE_DASHDOTDOT) return true;
+   }
+   return false;
+}
+
+void UpdateBreakevenMode()
+{
+   bool hasDashed = HasDashedLine();
+   if(hasDashed && CurrentBreakevenMode != BE_ByDashedHLine)
+   {
+      CurrentBreakevenMode = BE_ByDashedHLine;
+   }
+   else if(!hasDashed && CurrentBreakevenMode != BE_Standard)
+   {
+      CurrentBreakevenMode = BE_Standard;
+   }
+}
+
+bool GetDashedBreakevenLine(double &priceOut,string &lineNameOut)
+{
+   priceOut=0.0; lineNameOut="";
+   int total=ObjectsTotal(); if(total<=0) return false;
+
+   double mid=(Ask+Bid)/2.0;
+   double bestDist=DBL_MAX;
+   string bestName=""; double bestPrice=0.0;
+
+   for(int i=0;i<total;i++)
+   {
+      string name=ObjectName(i);
+      if(ObjectType(name)!=OBJ_HLINE) continue;
+      if(name==LimitLineName) continue;
+      if(name==kTPOverrideLineName) continue;
+      int style=(int)ObjectGetInteger(0,name,OBJPROP_STYLE);
+      if(style==STYLE_SOLID) continue;
+      double price=ObjectGetDouble(0,name,OBJPROP_PRICE,0);
+      if(price==0.0) continue;
+      double d=MathAbs(price-mid);
+      if(d<bestDist){ bestDist=d; bestName=name; bestPrice=price; }
+   }
+   if(bestName=="") return false;
+   priceOut=NormalizeDouble(bestPrice,Digits);
+   lineNameOut=bestName;
+   return true;
+}
+
+void ManageBreakevenByLine()
+{
+   double beLine=0.0; string lineName="";
+   if(!GetDashedBreakevenLine(beLine,lineName)) return;
+
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      int type=OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      int ticket=OrderTicket();
+      double entry=OrderOpenPrice();
+      double tp=OrderTakeProfit();
+      double offset=BreakevenOffsetPoints*Point;
+
+      if(IsBEDone(ticket)) continue;
+      if(WasJustActivated(ticket)) continue;
+
+      bool trigger=false;
+      double desiredSL=OrderStopLoss();
+
+      if(type==OP_BUY)
+      {
+         if(beLine<=entry) continue;
+         if(CrossedUp(beLine))
+         {
+            desiredSL=NormalizeDouble(entry+offset,Digits);
+            desiredSL=MathMin(desiredSL,Bid-2*Point);
+            if(desiredSL>OrderStopLoss()) trigger=true;
+         }
+      }
+      else
+      {
+         if(beLine>=entry) continue;
+         if(CrossedDown(beLine))
+         {
+            desiredSL=NormalizeDouble(entry-offset,Digits);
+            desiredSL=MathMax(desiredSL,Ask+2*Point);
+            if(desiredSL<OrderStopLoss()) trigger=true;
+         }
+      }
+      if(trigger)
+      {
+         if(OrderModify(ticket,entry,desiredSL,tp,0,clrGreen))
+         {
+            AddBEDone(ticket);
+         }
+         else
+         {
+            Print("[BE-Line] Error setting breakeven: ",GetLastError()," ticket=",ticket);
+         }
+      }
+   }
+}
+
+void ManageBreakeven_Standard()
+{
+   for (int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if (OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      if (OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
+      int ticket=OrderTicket();
+      if (IsBEDone(ticket)) continue;
+      double entry=OrderOpenPrice();
+      double sl =OrderStopLoss();
+      double sl_dist = MathAbs(entry-sl);
+      double sl_points = sl_dist/Point;
+      double profitPoints = (OrderType()==OP_BUY ? (Bid-entry)/Point : (entry-Ask)/Point);
+      if (profitPoints >= sl_points * BreakevenSLMultiplier)
+      {
+         double newSL = NormalizeDouble(entry + (OrderType()==OP_BUY ? BreakevenOffsetPoints*Point : -BreakevenOffsetPoints*Point), Digits);
+         if ((OrderType()==OP_BUY && (sl==0 || newSL>sl)) || (OrderType()==OP_SELL && (sl==0 || newSL<sl)))
+         {
+            double tp=OrderTakeProfit();
+            if (OrderModify(ticket,entry,newSL,tp,0,clrGreen))
+            {
+               AddBEDone(ticket);
+            }
+            else
+            {
+               Print("Error setting breakeven: ",GetLastError());
+            }
+         }
+      }
+   }
+}
+
+//====================== ATR / HUD ==================================
+double PipSize()
+{
+   return (Digits==5 || Digits==3) ? 10.0*Point : Point;
+}
+
+int ToPips(double price_distance)
+{
+   double pip=PipSize();
+   return (int)MathRound(price_distance/pip);
+}
+
+void DrawLabel(string name,int corner,int x,int y,string text,int fontsize,color c)
+{
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontsize);
+   ObjectSetText(name, text, fontsize, "Arial", c);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+}
+
+void CalculateATR_D1()
+{
+   int need = MathMax(D1_AvgRangePeriod,1)+1;
+   if(iBars(NULL,PERIOD_D1) < need) return;
+
+   double sum_d1=0.0;
+   for (int i=1;i<=D1_AvgRangePeriod;i++)
+      sum_d1 += (iHigh(NULL,PERIOD_D1,i) - iLow(NULL,PERIOD_D1,i));
+   ATR_D1_avg = sum_d1 / MathMax(D1_AvgRangePeriod,1);
+}
+
+void DrawHUD()
+{
+   int atr_d1_pips = ToPips(ATR_D1_avg);
+   string l_atr = StringFormat("ATR(D1) %d pp", atr_d1_pips);
+   DrawLabel("TP_HUD_ATR",2,10,10,l_atr,12,clrBlack);
+}
+
+//====================== LOT SIZE ===================================
+double ValuePerPoint_1lot()
+{
+   double tick_value=MarketInfo(Symbol(),MODE_TICKVALUE);
+   double tick_size =MarketInfo(Symbol(),MODE_TICKSIZE);
+   if (tick_size<=0.0) tick_size=Point;
+   return tick_value*(Point/tick_size);
+}
+
+double CalculateLot(double entry,double sl)
+{
+   double balance=AccountBalance();
+   double risk_money=balance*RiskPercent/100.0;
+   double sl_dist=MathAbs(entry-sl);
+   double sl_points=sl_dist/Point;
+   if (sl_points<=0){ Print("Error: Invalid SL points."); return 0.0; }
+   double vpp=ValuePerPoint_1lot();
+   if (vpp<=0){ Print("Error: invalid ValuePerPoint"); return 0.0; }
+   double lot=risk_money/(sl_points*vpp);
+   double min_lot=MarketInfo(Symbol(),MODE_MINLOT);
+   double max_lot=MarketInfo(Symbol(),MODE_MAXLOT);
+   double lot_step=MarketInfo(Symbol(),MODE_LOTSTEP);
+   lot=MathFloor(lot/lot_step)*lot_step;
+   lot=MathMax(min_lot,MathMin(max_lot,lot));
+   if (lot<min_lot)
+   {
+      lot=min_lot;
+   }
+   return lot;
+}
+
+//====================== LIMIT PENDING LOGIC ========================
+void EnsureLimitPending()
+{
+   UpdateLimitLine();
+
+   int existingType;
+   int existingTicket = FindLimitPending(existingType);
+
+   if(!LimitActive || CurrentTradeDir==NoTrade || !CanTradeToday())
+   {
+      if(existingTicket>0)
+      {
+         if(OrderSelect(existingTicket,SELECT_BY_TICKET))
+            OrderDelete(existingTicket);
+      }
+      return;
+   }
+
+   if(!IsInSession(TimeCurrent()))
+      return;
+
+   bool isBuy = (CurrentTradeDir==OnlyBuy);
+   int desiredType = isBuy ? OP_BUYLIMIT : OP_SELLLIMIT;
+
+   double entry = LimitLevel;
+   double stop_level = MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+   double freeze_lvl = MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point;
+   double min_dist   = MathMax(stop_level,freeze_lvl);
+
+   if(isBuy)
+   {
+      if(entry > Ask - min_dist)
+      {
+         Print("Limit BUY level too close to price/StopLevel.");
+         return;
+      }
+   }
+   else
+   {
+      if(entry < Bid + min_dist)
+      {
+         Print("Limit SELL level too close to price/StopLevel.");
+         return;
+      }
+   }
+   entry = NormalizeDouble(entry,Digits);
+
+   if(ATR_D1_avg <= 0.0)
+      return;
+
+   double sl_dist = SL_Percent * ATR_D1_avg;
+   double sl = NormalizeDouble(isBuy ? entry - sl_dist : entry + sl_dist,Digits);
+   double tp = NormalizeDouble(isBuy ? entry + TP_RR * sl_dist : entry - TP_RR * sl_dist,Digits);
+
+   double min_stop = stop_level;
+   if(MathAbs(sl-entry) < min_stop)
+      sl = NormalizeDouble(isBuy ? entry-min_stop : entry+min_stop,Digits);
+   if(MathAbs(tp-entry) < min_stop)
+      tp = NormalizeDouble(isBuy ? entry+min_stop : entry-min_stop,Digits);
+
+   double lot = CalculateLot(entry,sl);
+   if(lot <= 0.0) return;
+
+   if(kOnePositionOnly && CountOpenPositions()>0)
+      return;
+
+   if(existingTicket > 0)
+   {
+      if(!OrderSelect(existingTicket,SELECT_BY_TICKET))
+         existingTicket = -1;
+   }
+
+   if(existingTicket > 0)
+   {
+      if(existingType != desiredType)
+      {
+         OrderDelete(existingTicket);
+         existingTicket = -1;
+      }
+      else
+      {
+         double curEntry = OrderOpenPrice();
+         double curSL    = OrderStopLoss();
+         double curTP    = OrderTakeProfit();
+         double tol = Point/2.0;
+
+         bool needModify = (MathAbs(curEntry-entry)>tol ||
+                            MathAbs(curSL-sl)>tol ||
+                            MathAbs(curTP-tp)>tol);
+         if(needModify)
+         {
+            if(!OrderModify(existingTicket,entry,sl,tp,0,clrBlue))
+               Print("Limit pending modify error: ",GetLastError());
+         }
+         return;
+      }
+   }
+
+   if(!IsDirectionAllowed(desiredType)) return;
+
+   int ticket = OrderSend(Symbol(), desiredType, lot, entry,
+                          kMaxSlippagePoints, sl, tp,
+                          "Bot_Limit", MagicNumber, 0, clrBlue);
+   if(ticket <= 0)
+      Print("Limit pending send error: ",GetLastError());
+}
+
+//====================== STANDARD EVENTS ============================
+int OnInit()
+{
+   CurrentTradeDir = InputTradeDir;
+   CurrentBreakevenMode = BE_Standard;
+
+   BE_DoneCount = 0;
+   g_prevInited = false;
+
+   CalculateATR_D1();
+   CreateDirectionButtons();
+   DrawHUD();
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectDelete(0,kBuyButtonName);
+   ObjectDelete(0,kSellButtonName);
+   ObjectDelete(0,kOffButtonName);
+   ObjectDelete(0,kBEButtonName);
+   ObjectDelete(0,kLimitButtonName);
+   ObjectDelete(0,kTPButtonName);
+   ObjectDelete(0,kCloseAllButtonName);
+   ObjectDelete(0,LimitLineName);
+   if(reason==REASON_REMOVE) ObjectDelete(0,kTPOverrideLineName);
+   ObjectDelete(0,"TP_BE_LINE");
+   ObjectDelete(0,"TP_HUD_ATR");
+}
+
+void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
+{
+   if (id==CHARTEVENT_OBJECT_CLICK)
+   {
+      if (sparam==kBuyButtonName)
+      {
+         CurrentTradeDir=OnlyBuy;
+         UpdateButtonColors();
+         ObjectSetInteger(0,kBuyButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kSellButtonName)
+      {
+         CurrentTradeDir=OnlySell;
+         UpdateButtonColors();
+         ObjectSetInteger(0,kSellButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kOffButtonName)
+      {
+         CurrentTradeDir=NoTrade;
+         UpdateButtonColors();
+         ObjectSetInteger(0,kOffButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kBEButtonName)
+      {
+         double pip = ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+         double offset = 30.0 * pip;
+         double price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+         string beLineName = "TP_BE_LINE";
+         if(ObjectFind(0,beLineName) >= 0) ObjectDelete(0, beLineName);
+         ObjectCreate(0,beLineName, OBJ_HLINE, 0, 0, price);
+         ObjectSetInteger(0,beLineName, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0,beLineName, OBJPROP_COLOR, clrGreen);
+         ObjectSetInteger(0,beLineName, OBJPROP_WIDTH, 1);
+         ChartRedraw();
+         ObjectSetInteger(0,kBEButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kLimitButtonName)
+      {
+         double pip = ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+         double offset = 40.0 * pip;
+         double price;
+         if(CurrentTradeDir == OnlyBuy)      price = NormalizeDouble(Ask + offset, Digits);
+         else if(CurrentTradeDir == OnlySell)price = NormalizeDouble(Bid - offset, Digits);
+         else                                price = NormalizeDouble((Ask + Bid)/2 + offset, Digits);
+         if(ObjectFind(0,LimitLineName) >= 0) ObjectDelete(0, LimitLineName);
+         ObjectCreate(0, LimitLineName, OBJ_HLINE, 0, 0, price);
+         ObjectSetInteger(0, LimitLineName, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, LimitLineName, OBJPROP_COLOR, clrBlue);
+         ObjectSetInteger(0, LimitLineName, OBJPROP_WIDTH, 1);
+         ChartRedraw();
+         ObjectSetInteger(0,kLimitButtonName,OBJPROP_STATE,false);
+      }
+      if (sparam==kTPButtonName)
+      {
+         ObjectSetInteger(0,kTPButtonName,OBJPROP_STATE,false);
+         if(ObjectFind(0,kTPOverrideLineName) >= 0)
+         {
+            bool hadLine = (ObjectFind(0,kTPOverrideLineName) >= 0);
+            if(hadLine)
+            {
+               if(!ObjectDelete(0, kTPOverrideLineName))
+                  Print("Failed to delete TP override line. err=", GetLastError());
+               else
+                  ChartRedraw();
+            }
+            if(TPOverrideActive || hadLine)
+            {
+               TPOverrideActive = false;
+               TPOverrideLevel = 0.0;
+               TPOverridePendingRestore = true;
+               ulong now = GetTickCount();
+               if(now != g_tpLineRemovedLogTick)
+               {
+                  g_tpLineRemovedLogTick = now;
+                  Print("TP LINE REMOVED");
+               }
+            }
+         }
+         else
+         {
+            bool hasBuy=false, hasSell=false;
+            for(int i=OrdersTotal()-1;i>=0;i--)
+            {
+               if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+               if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+               int t=OrderType();
+               if(t==OP_BUY) hasBuy=true;
+               if(t==OP_SELL) hasSell=true;
+            }
+            TradeDirectionEnum d;
+            if(CurrentTradeDir==OnlyBuy || CurrentTradeDir==OnlySell)
+               d = (TradeDirectionEnum)CurrentTradeDir;
+            else if(hasBuy && !hasSell) d = OnlyBuy;
+            else if(hasSell && !hasBuy) d = OnlySell;
+            else d = OnlyBuy;
+
+            double dist = SL_Percent * ATR_D1_avg;
+            if(dist <= 0.0)
+            {
+               dist = 40.0 * ( (Digits==5 || Digits==3) ? 10.0*Point : Point );
+            }
+            double price = 0.0;
+            if(d==OnlySell) price = Bid - dist;
+            else            price = Ask + dist;
+            price = NormalizeDouble(price,Digits);
+
+            if(price > 0.0)
+            {
+               if(!ObjectCreate(0, kTPOverrideLineName, OBJ_HLINE, 0, 0, price))
+               {
+                  Print("Failed to create TP override line. err=", GetLastError());
+               }
+               else
+               {
+                  ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_STYLE, STYLE_DASH);
+                  ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_COLOR, clrRed);
+                  ObjectSetInteger(0, kTPOverrideLineName, OBJPROP_WIDTH, 1);
+                  TPOverrideLevel = price;
+                  TPOverrideActive = true;
+                  TPOverridePendingRestore = false;
+                  ChartRedraw();
+                  ulong now2 = GetTickCount();
+                  if(now2 != g_tpLineCreatedLogTick)
+                  {
+                     g_tpLineCreatedLogTick = now2;
+                     Print("TP LINE CREATED, price=", DoubleToStr(price,Digits));
+                  }
+               }
+            }
+         }
+      }
+      if (sparam==kCloseAllButtonName)
+      {
+         CloseAll();
+         ObjectSetInteger(0,kCloseAllButtonName,OBJPROP_STATE,false);
+      }
+   }
+}
+
+void OnTick()
+{
+   CheckButtonStates();
+   UpdateTPOverrideLineState();
+   HandleTPOverrideOnTick();
+
+   CalculateATR_D1();
+   EnforceDailyLossLimit();
+
+   UpdateBreakevenMode();
+   EnsureLimitPending();
+
+   if(CurrentBreakevenMode==BE_Standard)
+      ManageBreakeven_Standard();
+   else
+      ManageBreakevenByLine();
+
+   DrawHUD();
+
+   g_prevBid=Bid;
+   g_prevAsk=Ask;
+   g_prevInited=true;
+}
