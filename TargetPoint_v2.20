@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                          TargetPoint_v2.19.mq4   |
+//|                                          TargetPoint_v2.20.mq4   |
 //|                        Copyright 2025, MetaQuotes Software Corp. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Built by MaximK"
 #property link      ""
-#property version   "2.19"
+#property version   "2.20"
 #property strict
 #property description "TargetPoint Expert Advisor with simplified line logic, DailyExtremeBreak, Pin Bar, and auto BE-by-line"
 
